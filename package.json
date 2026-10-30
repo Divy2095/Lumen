@@ -4,7 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "dev": "tsx watch src/server.ts",
+    "dev": "node --env-file=.env --import tsx --watch src/server.ts",
     "typecheck": "tsc --noEmit"
   },
   "keywords": [],
@@ -12,10 +12,13 @@
   "license": "ISC",
   "type": "module",
   "dependencies": {
-    "fastify": "^5.12.7"
+    "fastify": "^5.12.7",
+    "fastify-plugin": "^6.0.1",
+    "pg": "^8.23.1"
   },
   "devDependencies": {
     "@types/node": "^26.6.6",
+    "@types/pg": "^8.23.1",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2"
   },
