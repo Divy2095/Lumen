@@ -2,10 +2,17 @@ import Fastify, { type FastifyInstance, type FastifyServerOptions } from 'fastif
 import databasePlugin from './plugins/database.js';
 import { healthRoutes } from './modules/health/health.route.js';
 
-export function buildApp(opts: FastifyServerOptions = {}): FastifyInstance {
-  const app = Fastify(opts);
+export interface BuildAppOptions extends FastifyServerOptions {
+  skipDatabase?: boolean;
+}
 
-  app.register(databasePlugin);
+export function buildApp(opts: BuildAppOptions = {}): FastifyInstance {
+  const { skipDatabase, ...fastifyOpts } = opts;
+  const app = Fastify(fastifyOpts);
+
+  if (!skipDatabase) {
+    app.register(databasePlugin);
+  }
   app.register(healthRoutes);
 
   return app;
