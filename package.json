@@ -1,12 +1,18 @@
 {
   "name": "lumen",
   "version": "1.0.0",
-  "description": "",
+  "description": "API-first media processing platform for developers",
   "main": "index.js",
   "scripts": {
     "dev": "node --env-file-if-exists=.env --import tsx --watch src/server.ts",
     "typecheck": "tsc --noEmit",
-    "test": "node --env-file-if-exists=.env --import tsx --test 'src/**/*.test.ts'"
+    "test": "node --env-file-if-exists=.env --import tsx --test 'src/**/*.test.ts'",
+    "db:migrate": "node --env-file-if-exists=.env node_modules/.bin/node-pg-migrate up",
+    "db:migrate:down": "node --env-file-if-exists=.env node_modules/.bin/node-pg-migrate down",
+    "db:migrate:status": "node --env-file-if-exists=.env --import tsx src/database/migrate-status.ts",
+    "migrate:up": "npm run db:migrate",
+    "migrate:down": "npm run db:migrate:down",
+    "migrate:status": "npm run db:migrate:status"
   },
   "keywords": [],
   "author": "",
@@ -15,7 +21,9 @@
   "dependencies": {
     "fastify": "^5.12.7",
     "fastify-plugin": "^6.0.1",
-    "pg": "^8.23.1"
+    "node-pg-migrate": "^9.0.0",
+    "pg": "^8.23.1",
+    "uuidv7": "^1.2.1"
   },
   "devDependencies": {
     "@types/node": "^26.6.6",
