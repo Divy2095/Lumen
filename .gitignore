@@ -8,3 +8,5 @@ coverage/
 .DS_Store
 skills
 AGENTS.md
+storage/
+storage_test/

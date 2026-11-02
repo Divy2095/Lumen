@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "node --env-file-if-exists=.env --import tsx --watch src/server.ts",
     "typecheck": "tsc --noEmit",
-    "test": "node --env-file-if-exists=.env --import tsx --test 'src/**/*.test.ts'",
+    "test": "PGDATABASE=lumen_test node --env-file-if-exists=.env --import tsx --test 'src/**/*.test.ts'",
     "db:migrate": "node --env-file-if-exists=.env node_modules/.bin/node-pg-migrate up",
     "db:migrate:down": "node --env-file-if-exists=.env node_modules/.bin/node-pg-migrate down",
     "db:migrate:status": "node --env-file-if-exists=.env --import tsx src/database/migrate-status.ts",

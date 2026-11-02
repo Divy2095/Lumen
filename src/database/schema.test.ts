@@ -2,16 +2,18 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseError, Pool } from 'pg';
 import { uuidv7 } from 'uuidv7';
+import { assertTestDatabase } from '../test/db-guard.js';
 
 const pool = new Pool({
   host: process.env.PGHOST ?? '127.0.0.1',
   port: process.env.PGPORT ? parseInt(process.env.PGPORT, 10) : 5432,
-  database: process.env.PGDATABASE ?? 'lumen',
+  database: process.env.PGDATABASE ?? 'lumen_test',
   user: process.env.PGUSER ?? 'lumen',
   password: process.env.PGPASSWORD,
 });
 
 async function cleanupTestData(): Promise<void> {
+  await assertTestDatabase(pool);
   await pool.query(`
     TRUNCATE TABLE
       idempotency_keys,
@@ -33,6 +35,7 @@ async function cleanupTestData(): Promise<void> {
 }
 
 test.before(async () => {
+  await assertTestDatabase(pool);
   await cleanupTestData();
 });
 
@@ -523,6 +526,20 @@ test('Schema Validation Suite', async (t) => {
         );
       },
       (err: unknown) => isDatabaseErrorWithCode(err, '23502') // not_null_violation
+    );
+  });
+
+  await t.test('13. Test database safety guard fails closed if database is not lumen_test', async () => {
+    // Construct a mock pool that reports current_database as 'lumen'
+    const fakeDevPool = {
+      query: async () => ({ rows: [{ current_database: 'lumen' }] }),
+    } as unknown as Pool;
+
+    await assert.rejects(
+      async () => {
+        await assertTestDatabase(fakeDevPool);
+      },
+      /CRITICAL DATABASE SAFETY VIOLATION/
     );
   });
 });
