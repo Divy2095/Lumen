@@ -5,8 +5,11 @@
   "main": "index.js",
   "scripts": {
     "dev": "node --env-file-if-exists=.env --import tsx --watch src/server.ts",
+    "worker": "node --env-file-if-exists=.env --import tsx src/workers/index.ts",
+    "outbox:publisher": "node --env-file-if-exists=.env --import tsx src/workers/outbox-publisher.ts",
+    "job:test": "node --env-file-if-exists=.env --import tsx src/scripts/submit-test-job.ts",
     "typecheck": "tsc --noEmit",
-    "test": "PGDATABASE=lumen_test node --env-file-if-exists=.env --import tsx --test 'src/**/*.test.ts'",
+    "test": "PGDATABASE=lumen_test node --env-file-if-exists=.env --import tsx --test --test-concurrency=1 'src/**/*.test.ts'",
     "db:migrate": "node --env-file-if-exists=.env node_modules/.bin/node-pg-migrate up",
     "db:migrate:down": "node --env-file-if-exists=.env node_modules/.bin/node-pg-migrate down",
     "db:migrate:status": "node --env-file-if-exists=.env --import tsx src/database/migrate-status.ts",
@@ -19,8 +22,10 @@
   "license": "ISC",
   "type": "module",
   "dependencies": {
+    "bullmq": "^6.5.4",
     "fastify": "^5.12.7",
     "fastify-plugin": "^6.0.1",
+    "ioredis": "^6.0.0",
     "node-pg-migrate": "^9.0.0",
     "pg": "^8.23.1",
     "uuidv7": "^1.2.1"

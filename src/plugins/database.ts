@@ -1,6 +1,7 @@
 import type { FastifyPluginAsync } from 'fastify';
 import fp from 'fastify-plugin';
-import { Pool, type PoolConfig } from 'pg';
+import { Pool } from 'pg';
+import { getDatabasePoolConfig } from '../database/pool.js';
 
 declare module 'fastify' {
   interface FastifyInstance {
@@ -9,30 +10,7 @@ declare module 'fastify' {
 }
 
 const dbPlugin: FastifyPluginAsync = async (fastify) => {
-  const password = process.env.PGPASSWORD;
-  if (!password) {
-    throw new Error('Database configuration error: PGPASSWORD environment variable is required');
-  }
-
-  const rawPort = process.env.PGPORT ?? '5432';
-  const port = Number(rawPort);
-  if (!Number.isInteger(port) || port < 1 || port > 65535) {
-    throw new Error(
-      `Database configuration error: PGPORT must be an integer between 1 and 65535, received "${rawPort}"`
-    );
-  }
-
-  const poolConfig: PoolConfig = {
-    host: process.env.PGHOST ?? '127.0.0.1',
-    port,
-    database: process.env.PGDATABASE ?? 'lumen',
-    user: process.env.PGUSER ?? 'lumen',
-    password,
-    max: 10,
-    idleTimeoutMillis: 30000,
-    connectionTimeoutMillis: 5000,
-  };
-
+  const poolConfig = getDatabasePoolConfig();
   const pool = new Pool(poolConfig);
 
   let isClosed = false;

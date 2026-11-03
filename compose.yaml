@@ -6,7 +6,8 @@ services:
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-lumen}
       POSTGRES_USER: ${POSTGRES_USER:-lumen}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-replace_with_a_strong_password}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      # POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-f2nYEcFo6dSBT31YliyvqeeP} # Do i need to keep password here or in the environment?
     ports:
       - "127.0.0.1:5432:5432"
     volumes:
@@ -18,5 +19,21 @@ services:
       retries: 5
       start_period: 10s
 
+  redis:
+    image: redis:7-alpine
+    container_name: lumen-redis
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
 volumes:
   postgres_data:
+  redis_data:

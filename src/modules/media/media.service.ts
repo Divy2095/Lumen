@@ -239,52 +239,138 @@ export class MediaService {
   }
 
   /**
-   * Finalizes successful upload of media asset.
-   * Strictly enforces state transition: uploading -> ready.
-   * Throws InvalidStateTransitionError if the asset is not in 'uploading' status.
+   * Finalizes successful upload of media asset atomically in a single PostgreSQL transaction.
+   *
+   * 1. Strictly enforces state transition: uploading -> ready.
+   * 2. Creates the required background processing job records (extract_metadata, generate_thumbnail).
+   * 3. Inserts corresponding transactional outbox event records for reliable queue dispatch.
+   *
+   * If any step fails, the entire transaction rolls back cleanly.
    */
   async finalizeUpload(assetId: string, uploadedBytes: number): Promise<MediaAssetPublic> {
-    const query = `
-      UPDATE media_assets
-      SET status = 'ready',
-          uploaded_bytes = $2,
-          upload_token_hash = NULL,
-          upload_token_expires_at = NULL,
-          updated_at = NOW()
-      WHERE id = $1 AND status = 'uploading'
-      RETURNING id, project_id, status, original_filename, mime_type, file_size_bytes, uploaded_bytes, created_at, updated_at;
-    `;
+    const client = await this.db.connect();
 
-    const result = await this.db.query<{
-      id: string;
-      project_id: string;
-      status: string;
-      original_filename: string;
-      mime_type: string;
-      file_size_bytes: string;
-      uploaded_bytes: string;
-      created_at: Date;
-      updated_at: Date;
-    }>(query, [assetId, uploadedBytes]);
+    try {
+      await client.query('BEGIN');
 
-    if (result.rowCount === 0) {
-      throw new InvalidStateTransitionError(
-        `Cannot finalize asset "${assetId}": asset is not in "uploading" status`
-      );
+      // 1. Transition media asset from 'uploading' to 'ready'
+      const updateAssetQuery = `
+        UPDATE media_assets
+        SET status = 'ready',
+            uploaded_bytes = $2,
+            upload_token_hash = NULL,
+            upload_token_expires_at = NULL,
+            updated_at = NOW()
+        WHERE id = $1 AND status = 'uploading'
+        RETURNING id, project_id, status, original_filename, mime_type, file_size_bytes, uploaded_bytes, created_at, updated_at;
+      `;
+
+      const assetResult = await client.query<{
+        id: string;
+        project_id: string;
+        status: string;
+        original_filename: string;
+        mime_type: string;
+        file_size_bytes: string;
+        uploaded_bytes: string;
+        created_at: Date;
+        updated_at: Date;
+      }>(updateAssetQuery, [assetId, uploadedBytes]);
+
+      if (assetResult.rowCount === 0) {
+        throw new InvalidStateTransitionError(
+          `Cannot finalize asset "${assetId}": asset is not in "uploading" status`
+        );
+      }
+
+      const assetRow = assetResult.rows[0]!;
+
+      // 2. Define processing jobs to create for the ingested video
+      const initialJobs = [
+        {
+          id: uuidv7(),
+          operation: 'extract_metadata',
+          parameters: {},
+        },
+        {
+          id: uuidv7(),
+          operation: 'generate_thumbnail',
+          parameters: { offset_seconds: 1.0 },
+        },
+      ];
+
+      // 3. Insert processing job records
+      const insertJobQuery = `
+        INSERT INTO processing_jobs (
+          id,
+          project_id,
+          media_asset_id,
+          operation,
+          parameters,
+          status,
+          current_attempt_number,
+          created_at
+        )
+        VALUES ($1, $2, $3, $4, $5, 'queued', 0, NOW());
+      `;
+
+      // 4. Insert corresponding outbox event records
+      const insertOutboxQuery = `
+        INSERT INTO outbox_events (
+          id,
+          aggregate_type,
+          aggregate_id,
+          event_type,
+          payload,
+          created_at
+        )
+        VALUES ($1, 'processing_job', $2, 'processing_job.created', $3, NOW());
+      `;
+
+      for (const job of initialJobs) {
+        await client.query(insertJobQuery, [
+          job.id,
+          assetRow.project_id,
+          assetRow.id,
+          job.operation,
+          JSON.stringify(job.parameters),
+        ]);
+
+        const outboxEventId = uuidv7();
+        const payload = {
+          jobId: job.id,
+          projectId: assetRow.project_id,
+          mediaAssetId: assetRow.id,
+          operation: job.operation,
+          parameters: job.parameters,
+        };
+
+        await client.query(insertOutboxQuery, [
+          outboxEventId,
+          job.id,
+          JSON.stringify(payload),
+        ]);
+      }
+
+      await client.query('COMMIT');
+
+      return {
+        id: assetRow.id,
+        project_id: assetRow.project_id,
+        status: assetRow.status,
+        original_filename: assetRow.original_filename,
+        mime_type: assetRow.mime_type,
+        file_size_bytes: Number(assetRow.file_size_bytes),
+        uploaded_bytes: Number(assetRow.uploaded_bytes),
+        created_at: assetRow.created_at.toISOString(),
+        updated_at: assetRow.updated_at.toISOString(),
+      };
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw err;
+    } finally {
+      client.release();
     }
-
-    const row = result.rows[0]!;
-    return {
-      id: row.id,
-      project_id: row.project_id,
-      status: row.status,
-      original_filename: row.original_filename,
-      mime_type: row.mime_type,
-      file_size_bytes: Number(row.file_size_bytes),
-      uploaded_bytes: Number(row.uploaded_bytes),
-      created_at: row.created_at.toISOString(),
-      updated_at: row.updated_at.toISOString(),
-    };
   }
 
   /**
