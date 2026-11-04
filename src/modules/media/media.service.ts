@@ -7,6 +7,7 @@ import {
   type RegisterMediaResponse,
   type MediaAssetPublic,
   type ClaimUploadResult,
+  type ThumbnailInfo,
   InvalidStateTransitionError,
 } from './media.types.js';
 
@@ -456,7 +457,55 @@ export class MediaService {
       return null;
     }
 
-    return {
+    // Query media_outputs for current thumbnail
+    const thumbQuery = `
+      SELECT id, mime_type, file_size_bytes, width, height, created_at
+      FROM media_outputs
+      WHERE media_asset_id = $1 AND output_type = 'thumbnail' AND is_current = true;
+    `;
+    const thumbResult = await this.db.query<{
+      id: string;
+      mime_type: string;
+      file_size_bytes: string;
+      width: number | null;
+      height: number | null;
+      created_at: Date;
+    }>(thumbQuery, [assetId]);
+
+    let thumbnail: ThumbnailInfo | undefined = undefined;
+
+    if (thumbResult.rows.length > 0) {
+      const tRow = thumbResult.rows[0]!;
+      thumbnail = {
+        status: 'ready',
+        url: `/v1/media/${assetId}/thumbnail`,
+        mime_type: tRow.mime_type,
+        width: tRow.width,
+        height: tRow.height,
+        file_size_bytes: Number(tRow.file_size_bytes),
+        created_at: tRow.created_at.toISOString(),
+      };
+    } else {
+      // Check if a thumbnail job is queued/processing or failed
+      const jobQuery = `
+        SELECT status
+        FROM processing_jobs
+        WHERE media_asset_id = $1 AND operation = 'generate_thumbnail'
+        ORDER BY created_at DESC
+        LIMIT 1;
+      `;
+      const jobResult = await this.db.query<{ status: string }>(jobQuery, [assetId]);
+      if (jobResult.rows.length > 0) {
+        const jStatus = jobResult.rows[0]!.status;
+        if (jStatus === 'queued' || jStatus === 'processing') {
+          thumbnail = { status: 'processing' };
+        } else if (jStatus === 'failed') {
+          thumbnail = { status: 'failed' };
+        }
+      }
+    }
+
+    const publicAsset: MediaAssetPublic = {
       id: row.id,
       project_id: row.project_id,
       status: row.status,
@@ -466,6 +515,47 @@ export class MediaService {
       uploaded_bytes: Number(row.uploaded_bytes),
       created_at: row.created_at.toISOString(),
       updated_at: row.updated_at.toISOString(),
+    };
+
+    if (thumbnail !== undefined) {
+      publicAsset.thumbnail = thumbnail;
+    }
+
+    return publicAsset;
+  }
+
+  /**
+   * Retrieves current thumbnail storage key and metadata for an authorized media asset.
+   */
+  async getThumbnail(projectId: string, assetId: string): Promise<{
+    storageKey: string;
+    mimeType: string;
+    fileSizeBytes: number;
+  } | null> {
+    const query = `
+      SELECT mo.storage_key, mo.mime_type, mo.file_size_bytes
+      FROM media_outputs mo
+      JOIN media_assets ma ON ma.id = mo.media_asset_id
+      WHERE mo.media_asset_id = $1
+        AND ma.project_id = $2
+        AND mo.output_type = 'thumbnail'
+        AND mo.is_current = true;
+    `;
+    const result = await this.db.query<{
+      storage_key: string;
+      mime_type: string;
+      file_size_bytes: string;
+    }>(query, [assetId, projectId]);
+
+    const row = result.rows[0];
+    if (!row) {
+      return null;
+    }
+
+    return {
+      storageKey: row.storage_key,
+      mimeType: row.mime_type,
+      fileSizeBytes: Number(row.file_size_bytes),
     };
   }
 }

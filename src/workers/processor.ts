@@ -14,12 +14,18 @@ import {
   type ProcessingJobResult,
 } from './queue.js';
 import { defaultFFprobeService, type FFprobeService } from '../modules/media/ffprobe.service.js';
+import {
+  defaultFFmpegService,
+  calculateThumbnailTimestamp,
+  type FFmpegService,
+} from '../modules/media/ffmpeg.service.js';
 import { defaultStorageService, type StorageService } from '../shared/storage/local-storage.service.js';
 
 export interface ProcessJobOptions {
   workerId?: string | undefined;
   leaseDurationMs?: number | undefined;
   ffprobeService?: FFprobeService | undefined;
+  ffmpegService?: FFmpegService | undefined;
   storageService?: StorageService | undefined;
 }
 
@@ -213,7 +219,9 @@ export async function processJob(
         // 3. Record attempt in job_attempts with fencing token
         const attemptId = uuidv7();
         await db.query(
-          `INSERT INTO job_attempts (\n             id, job_id, attempt_number, status, fencing_token, started_at\n           ) VALUES ($1, $2, $3, 'processing', $4, NOW());`,
+          `INSERT INTO job_attempts (
+             id, job_id, attempt_number, status, fencing_token, started_at
+           ) VALUES ($1, $2, $3, 'processing', $4, NOW());`,
           [attemptId, claimedJob.id, claimedJob.current_attempt_number, leaseToken]
         );
 
@@ -252,7 +260,13 @@ export async function processJob(
             try {
               await client.query('BEGIN');
 
-              // 1. Guarded completion update on processing_jobs
+              // 1. Serialize version allocation and prevent concurrent conflicting inserts for this media asset
+              await client.query(
+                `SELECT id FROM media_assets WHERE id = $1 FOR UPDATE;`,
+                [data.mediaAssetId]
+              );
+
+              // 2. Guarded completion update on processing_jobs
               const completeJobResult = await client.query(
                 `UPDATE processing_jobs
                  SET status = 'completed',
@@ -314,8 +328,173 @@ export async function processJob(
             } finally {
               client.release();
             }
+          } else if (data.operation === 'generate_thumbnail') {
+            // Real FFmpeg thumbnail generation
+            const assetRes = await db.query<{
+              id: string;
+              project_id: string;
+              storage_key: string;
+              duration_seconds: string | null;
+              status: string;
+            }>(
+              `SELECT id, project_id, storage_key, duration_seconds, status
+               FROM media_assets
+               WHERE id = $1 AND project_id = $2;`,
+              [data.mediaAssetId, data.projectId]
+            );
+
+            const asset = assetRes.rows[0];
+            if (!asset) {
+              throw new Error(`Media asset "${data.mediaAssetId}" not found for project "${data.projectId}"`);
+            }
+
+            const storage = options.storageService ?? defaultStorageService;
+            const inputFilePath = storage.resolvePath(asset.storage_key);
+            const exists = await storage.fileExists(inputFilePath);
+            if (!exists) {
+              throw new Error(`Media file not found at storage path for asset "${data.mediaAssetId}"`);
+            }
+
+            // Derive duration from trusted database column or fallback to probing
+            let durationSeconds = asset.duration_seconds ? parseFloat(asset.duration_seconds) : null;
+            if (durationSeconds === null || !Number.isFinite(durationSeconds) || durationSeconds <= 0) {
+              try {
+                const ffprobe = options.ffprobeService ?? defaultFFprobeService;
+                const probeRes = await ffprobe.probe(inputFilePath);
+                durationSeconds = probeRes.durationSeconds;
+              } catch {
+                durationSeconds = 1.0;
+              }
+            }
+
+            const requestedOffset =
+              data.parameters && typeof data.parameters['offset_seconds'] === 'number'
+                ? (data.parameters['offset_seconds'] as number)
+                : undefined;
+            const seekSeconds = calculateThumbnailTimestamp(durationSeconds, requestedOffset);
+
+            const tempThumbnailPath = storage.createTempFilePath('thumb');
+            const ffmpeg = options.ffmpegService ?? defaultFFmpegService;
+            const thumbResult = await ffmpeg.extractThumbnail(inputFilePath, tempThumbnailPath, seekSeconds);
+
+            const logicalKey = 'thumbnail_default';
+            const outputId = uuidv7();
+            const thumbnailStorageKey = `media/${data.projectId}/${data.mediaAssetId}/thumbnails/${logicalKey}_${outputId}.jpg`;
+
+            // Atomically place thumbnail in storage destination
+            await storage.commitFile(tempThumbnailPath, thumbnailStorageKey);
+
+            // Commit output record and complete job in an atomic transaction guarded by fencing token and unexpired lease
+            const client = await db.connect();
+            let commitCommitted = false;
+            try {
+              await client.query('BEGIN');
+
+              // 1. Serialize version allocation and prevent concurrent conflicting inserts for this media asset
+              await client.query(
+                `SELECT id FROM media_assets WHERE id = $1 FOR UPDATE;`,
+                [data.mediaAssetId]
+              );
+
+              // 2. Guarded completion update on processing_jobs
+              const completeJobResult = await client.query(
+                `UPDATE processing_jobs
+                 SET status = 'completed',
+                     lease_token = NULL,
+                     lease_expires_at = NULL,
+                     locked_by = NULL,
+                     completed_at = NOW()
+                 WHERE id = $1 AND lease_token = $2 AND lease_expires_at >= NOW()
+                 RETURNING id;`,
+                [data.jobId, leaseToken]
+              );
+
+              if (!completeJobResult.rowCount || completeJobResult.rowCount === 0) {
+                throw new Error(
+                  `Worker lease expired or was revoked for job "${data.jobId}" before completion could be committed`
+                );
+              }
+
+              // 3. Determine monotonic version for (media_asset_id, logical_key)
+              const versionRes = await client.query<{ next_version: string }>(
+                `SELECT COALESCE(MAX(version), 0) + 1 AS next_version
+                 FROM media_outputs
+                 WHERE media_asset_id = $1 AND logical_key = $2;`,
+                [data.mediaAssetId, logicalKey]
+              );
+              const nextVersion = parseInt(versionRes.rows[0]?.next_version ?? '1', 10);
+
+              // 4. Demote existing current thumbnail outputs for this logical key
+              await client.query(
+                `UPDATE media_outputs
+                 SET is_current = false
+                 WHERE media_asset_id = $1 AND logical_key = $2 AND is_current = true;`,
+                [data.mediaAssetId, logicalKey]
+              );
+
+              // 5. Insert new current thumbnail output
+              await client.query(
+                `INSERT INTO media_outputs (
+                   id, media_asset_id, processing_job_id, output_type, logical_key,
+                   version, is_current, storage_key, mime_type, file_size_bytes,
+                   width, height, metadata, created_at
+                 ) VALUES (
+                   $1, $2, $3, 'thumbnail', $4,
+                   $5, true, $6, $7, $8,
+                   $9, $10, $11, NOW()
+                 );`,
+                [
+                  outputId,
+                  data.mediaAssetId,
+                  data.jobId,
+                  logicalKey,
+                  nextVersion,
+                  thumbnailStorageKey,
+                  thumbResult.mimeType,
+                  thumbResult.fileSizeBytes,
+                  thumbResult.width,
+                  thumbResult.height,
+                  JSON.stringify({
+                    offset_seconds: thumbResult.timestamp,
+                    format: 'jpeg',
+                  }),
+                ]
+              );
+
+              // 5. Update media_assets metadata with thumbnail pointer
+              await client.query(
+                `UPDATE media_assets
+                 SET metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object('thumbnail_output_id', $2::text),
+                     updated_at = NOW()
+                 WHERE id = $1 AND project_id = $3;`,
+                [data.mediaAssetId, outputId, data.projectId]
+              );
+
+              // 6. Complete attempt record
+              await client.query(
+                `UPDATE job_attempts
+                 SET status = 'completed',
+                     completed_at = NOW()
+                 WHERE job_id = $1 AND attempt_number = $2 AND fencing_token = $3;`,
+                [data.jobId, claimedJob.current_attempt_number, leaseToken]
+              );
+
+              await client.query('COMMIT');
+              commitCommitted = true;
+            } catch (txErr) {
+              await client.query('ROLLBACK').catch(() => {});
+              // If transaction failed or rolled back, clean up newly committed thumbnail file
+              if (!commitCommitted) {
+                await storage.unlinkFile(thumbnailStorageKey).catch(() => {});
+              }
+              throw txErr;
+            } finally {
+              client.release();
+              // Ensure any leftover temp file is cleaned up
+              await storage.unlinkFile(tempThumbnailPath).catch(() => {});
+            }
           } else {
-            // Placeholder processing for other operations (generate_thumbnail, transcode)
+            // Placeholder processing for other operations (transcode)
             await new Promise((resolve) => setTimeout(resolve, 50));
 
             const completeJobResult = await db.query(

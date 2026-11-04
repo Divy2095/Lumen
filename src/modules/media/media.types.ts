@@ -18,6 +18,16 @@ export interface RegisterMediaResponse {
   created_at: string;
 }
 
+export interface ThumbnailInfo {
+  status: 'ready' | 'processing' | 'failed' | 'not_found';
+  url?: string | undefined;
+  mime_type?: string | undefined;
+  width?: number | null | undefined;
+  height?: number | null | undefined;
+  file_size_bytes?: number | undefined;
+  created_at?: string | undefined;
+}
+
 export interface MediaAssetPublic {
   id: string;
   project_id: string;
@@ -28,6 +38,7 @@ export interface MediaAssetPublic {
   uploaded_bytes: number;
   created_at: string;
   updated_at: string;
+  thumbnail?: ThumbnailInfo | undefined;
 }
 
 export interface ClaimUploadResult {

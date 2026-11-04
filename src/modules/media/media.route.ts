@@ -1,5 +1,6 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { pipeline } from 'node:stream/promises';
+import { createReadStream } from 'node:fs';
 import { MediaService } from './media.service.js';
 import { Mp4StreamInspector } from './mp4-validator.js';
 import { defaultStorageService } from '../../shared/storage/local-storage.service.js';
@@ -442,6 +443,45 @@ export const mediaRoutes: FastifyPluginAsync = async (fastify) => {
       }
 
       return reply.status(200).send(asset);
+    }
+  );
+
+  // GET /v1/media/:id/thumbnail (Stream thumbnail image)
+  fastify.get(
+    '/v1/media/:id/thumbnail',
+    {
+      preHandler: [(fastify as any).authenticateApiKey],
+    },
+    async (request, reply) => {
+      const project = request.project!;
+      const { id: assetId } = request.params as { id: string };
+
+      const thumbnail = await mediaService.getThumbnail(project.id, assetId);
+      if (!thumbnail) {
+        return reply.status(404).send({
+          error: 'thumbnail_not_found',
+          message: 'Thumbnail not found or not ready for this media asset',
+        });
+      }
+
+      const filePath = defaultStorageService.resolvePath(thumbnail.storageKey);
+      const exists = await defaultStorageService.fileExists(filePath);
+      if (!exists) {
+        return reply.status(404).send({
+          error: 'thumbnail_not_found',
+          message: 'Thumbnail file is missing from storage',
+        });
+      }
+
+      const stream = createReadStream(filePath);
+      stream.on('error', (err) => {
+        request.log.error({ err }, 'Streaming error occurred while reading thumbnail file');
+      });
+      return reply
+        .type(thumbnail.mimeType)
+        .header('Content-Length', thumbnail.fileSizeBytes)
+        .header('Cache-Control', 'private, max-age=86400')
+        .send(stream);
     }
   );
 };

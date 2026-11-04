@@ -8,6 +8,7 @@ import {
 } from './queue.js';
 import { processJob, type ProcessJobOptions } from './processor.js';
 import type { FFprobeService } from '../modules/media/ffprobe.service.js';
+import type { FFmpegService } from '../modules/media/ffmpeg.service.js';
 import type { StorageService } from '../shared/storage/local-storage.service.js';
 
 export interface WorkerLogger {
@@ -35,6 +36,7 @@ export interface CreateWorkerOptions {
   logger?: WorkerLogger | undefined;
   db?: Pool | undefined;
   ffprobeService?: FFprobeService | undefined;
+  ffmpegService?: FFmpegService | undefined;
   storageService?: StorageService | undefined;
 }
 
@@ -54,6 +56,9 @@ export function createMediaWorker(
       const processOptions: ProcessJobOptions = {};
       if (options.ffprobeService !== undefined) {
         processOptions.ffprobeService = options.ffprobeService;
+      }
+      if (options.ffmpegService !== undefined) {
+        processOptions.ffmpegService = options.ffmpegService;
       }
       if (options.storageService !== undefined) {
         processOptions.storageService = options.storageService;
