@@ -1,7 +1,14 @@
+import type {
+  TranscodingConfig,
+  SkippedProfile,
+  TranscodingProfileName,
+} from './transcoding-profiles.js';
+
 export interface RegisterMediaInput {
   original_filename: string;
   mime_type: string;
   file_size_bytes: number;
+  transcoding?: TranscodingConfig | undefined;
 }
 
 export interface RegisterMediaResponse {
@@ -16,6 +23,7 @@ export interface RegisterMediaResponse {
   upload_url: string;
   upload_expires_at: string;
   created_at: string;
+  transcoding_config?: TranscodingConfig | null | undefined;
 }
 
 export interface ThumbnailInfo {
@@ -26,6 +34,27 @@ export interface ThumbnailInfo {
   height?: number | null | undefined;
   file_size_bytes?: number | undefined;
   created_at?: string | undefined;
+}
+
+export interface TranscodingRenditionInfo {
+  profile: TranscodingProfileName;
+  status: string;
+  target_width?: number | undefined;
+  target_height?: number | undefined;
+  width?: number | undefined;
+  height?: number | undefined;
+  file_size_bytes?: number | undefined;
+  mime_type?: string | undefined;
+  version?: number | undefined;
+  completed_at?: string | undefined;
+  url?: string | undefined;
+  job_id?: string | undefined;
+}
+
+export interface TranscodingStatusInfo {
+  mode?: string | undefined;
+  skipped: SkippedProfile[];
+  renditions: TranscodingRenditionInfo[];
 }
 
 export interface MediaAssetPublic {
@@ -39,6 +68,9 @@ export interface MediaAssetPublic {
   created_at: string;
   updated_at: string;
   thumbnail?: ThumbnailInfo | undefined;
+  transcoding_config?: TranscodingConfig | null | undefined;
+  transcoding?: TranscodingStatusInfo | undefined;
+  skipped_profiles?: SkippedProfile[] | undefined;
 }
 
 export interface ClaimUploadResult {
@@ -50,6 +82,16 @@ export interface ClaimUploadResult {
     fileSizeBytes: number;
     storageKey: string;
   };
+}
+
+export interface RenditionDeliveryResult {
+  status: 'ready' | 'processing' | 'failed' | 'not_found' | 'asset_not_found' | 'invalid_profile';
+  storageKey?: string | undefined;
+  mimeType?: string | undefined;
+  fileSizeBytes?: number | undefined;
+  width?: number | undefined;
+  height?: number | undefined;
+  version?: number | undefined;
 }
 
 export class InvalidStateTransitionError extends Error {

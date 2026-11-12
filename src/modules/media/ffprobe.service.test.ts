@@ -1,8 +1,10 @@
+import '../../test/integration-preload.js';
+import { testStorageDirectory, removeTestStorage } from '../../test/test-environment.js';
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { resolve } from 'node:path';
 import { copyFile, mkdir, rm } from 'node:fs/promises';
-import { Pool } from 'pg';
+import { TestPool as Pool } from '../../test/db-guard.js';
 import { uuidv7 } from 'uuidv7';
 import { type Job } from 'bullmq';
 import {
@@ -13,6 +15,7 @@ import {
   InvalidMediaError,
   parseFrameRate,
   parseDuration,
+  parseRotation,
 } from './ffprobe.service.js';
 import { processJob } from '../../workers/processor.js';
 import {
@@ -29,7 +32,7 @@ const FIXTURES_DIR = resolve('src/test/fixtures');
 const VALID_SAMPLE_MP4 = resolve(FIXTURES_DIR, 'valid_sample.mp4');
 const AUDIO_ONLY_MP4 = resolve(FIXTURES_DIR, 'audio_only.mp4');
 const CORRUPT_MP4 = resolve(FIXTURES_DIR, 'corrupt.mp4');
-const TEST_STORAGE_DIR = resolve('storage_ffprobe_test');
+const TEST_STORAGE_DIR = testStorageDirectory('ffprobe-service');
 
 describe('FFprobe Metadata Extraction Suite', () => {
   describe('1. Unit Tests — Helper Functions', () => {
@@ -56,6 +59,53 @@ describe('FFprobe Metadata Extraction Suite', () => {
       assert.throws(() => parseDuration(undefined, undefined), InvalidMediaError);
       assert.throws(() => parseDuration('-5'), InvalidMediaError);
     });
+
+    it('parseRotation extracts rotation from stream Display Matrix side data', () => {
+      assert.strictEqual(
+        parseRotation({
+          side_data_list: [{ side_data_type: 'Display Matrix', rotation: -90 }],
+        }),
+        270
+      );
+      assert.strictEqual(
+        parseRotation({
+          side_data_list: [{ side_data_type: 'Display Matrix', rotation: 90 }],
+        }),
+        90
+      );
+      assert.strictEqual(
+        parseRotation({
+          side_data_list: [{ side_data_type: 'Display Matrix', rotation: 180 }],
+        }),
+        180
+      );
+    });
+
+    it('parseRotation extracts rotation from stream tags.rotate or format tags', () => {
+      assert.strictEqual(
+        parseRotation({
+          tags: { rotate: '90' },
+        }),
+        90
+      );
+      assert.strictEqual(
+        parseRotation({
+          tags: { rotate: '270' },
+        }),
+        270
+      );
+      assert.strictEqual(
+        parseRotation({}, { tags: { rotate: '180' } }),
+        180
+      );
+    });
+
+    it('parseRotation returns 0 when no rotation metadata exists or is invalid', () => {
+      assert.strictEqual(parseRotation({}), 0);
+      assert.strictEqual(parseRotation(undefined, undefined), 0);
+      assert.strictEqual(parseRotation({ tags: { rotate: 'invalid' } }), 0);
+      assert.strictEqual(parseRotation({ side_data_list: [{ side_data_type: 'other' }] }), 0);
+    });
   });
 
   describe('2. Unit Tests — FFprobeService Execution & Validation', () => {
@@ -72,6 +122,7 @@ describe('FFprobe Metadata Extraction Suite', () => {
       assert.strictEqual(metadata.video.height, 240);
       assert.strictEqual(metadata.video.frameRate, 24);
       assert.strictEqual(metadata.video.pixelFormat, 'yuv420p');
+      assert.strictEqual(metadata.video.rotation, 0);
 
       // Audio stream is present
       assert.ok(metadata.audio);
@@ -83,6 +134,7 @@ describe('FFprobe Metadata Extraction Suite', () => {
       assert.ok(metadata.rawMetadata);
       assert.strictEqual(metadata.rawMetadata?.format_name, metadata.containerFormat);
       assert.strictEqual(metadata.rawMetadata?.video.codec, 'mpeg4');
+      assert.strictEqual(metadata.rawMetadata?.video.rotation, 0);
     });
 
     it('rejects corrupt MP4 fixture with InvalidMediaError', async () => {
@@ -199,6 +251,26 @@ describe('FFprobe Metadata Extraction Suite', () => {
         /Invalid video width/
       );
     });
+
+    it('parseMetadata populates video.rotation and rawMetadata.video.rotation correctly', () => {
+      const rotatedJson = JSON.stringify({
+        format: { format_name: 'mov,mp4', duration: '1.0' },
+        streams: [
+          {
+            codec_type: 'video',
+            codec_name: 'h264',
+            width: 1920,
+            height: 1080,
+            r_frame_rate: '30/1',
+            side_data_list: [{ side_data_type: 'Display Matrix', rotation: -90 }],
+          },
+        ],
+      });
+
+      const parsed = service.parseMetadata(rotatedJson);
+      assert.strictEqual(parsed.video.rotation, 270);
+      assert.strictEqual(parsed.rawMetadata?.video.rotation, 270);
+    });
   });
 
   describe('3. Integration Tests — Worker & PostgreSQL Metadata Persistence', () => {
@@ -246,7 +318,7 @@ describe('FFprobe Metadata Extraction Suite', () => {
         await pool.query('DELETE FROM accounts WHERE id = $1;', [testAccountId]).catch(() => {});
         await pool.end();
       }
-      await rm(TEST_STORAGE_DIR, { recursive: true, force: true });
+      await removeTestStorage(TEST_STORAGE_DIR);
     });
 
     it('worker successfully extracts and persists metadata in media_assets', async () => {
@@ -362,16 +434,12 @@ describe('FFprobe Metadata Extraction Suite', () => {
       await copyFile(VALID_SAMPLE_MP4, destPath);
 
       await pool.query(
-        `INSERT INTO media_assets (
-           id, project_id, original_filename, mime_type, file_size_bytes, uploaded_bytes, storage_key, status
-         ) VALUES ($1, $2, 'stale_test.mp4', 'video/mp4', 48796, 48796, $3, 'ready');`,
+        `INSERT INTO media_assets (\n           id, project_id, original_filename, mime_type, file_size_bytes, uploaded_bytes, storage_key, status\n         ) VALUES ($1, $2, 'stale_test.mp4', 'video/mp4', 48796, 48796, $3, 'ready');`,
         [assetId, testProjectId, storageKey]
       );
 
       await pool.query(
-        `INSERT INTO processing_jobs (
-           id, project_id, media_asset_id, operation, parameters, status, current_attempt_number
-         ) VALUES ($1, $2, $3, 'extract_metadata', '{}'::jsonb, 'queued', 0);`,
+        `INSERT INTO processing_jobs (\n           id, project_id, media_asset_id, operation, parameters, status, current_attempt_number\n         ) VALUES ($1, $2, $3, 'extract_metadata', '{}'::jsonb, 'queued', 0);`,
         [jobId, testProjectId, assetId]
       );
 
@@ -429,16 +497,12 @@ describe('FFprobe Metadata Extraction Suite', () => {
       await copyFile(CORRUPT_MP4, destPath);
 
       await pool.query(
-        `INSERT INTO media_assets (
-           id, project_id, original_filename, mime_type, file_size_bytes, uploaded_bytes, storage_key, status
-         ) VALUES ($1, $2, 'corrupt.mp4', 'video/mp4', 512, 512, $3, 'ready');`,
+        `INSERT INTO media_assets (\n           id, project_id, original_filename, mime_type, file_size_bytes, uploaded_bytes, storage_key, status\n         ) VALUES ($1, $2, 'corrupt.mp4', 'video/mp4', 512, 512, $3, 'ready');`,
         [assetId, testProjectId, storageKey]
       );
 
       await pool.query(
-        `INSERT INTO processing_jobs (
-           id, project_id, media_asset_id, operation, parameters, status, current_attempt_number
-         ) VALUES ($1, $2, $3, 'extract_metadata', '{}'::jsonb, 'queued', 0);`,
+        `INSERT INTO processing_jobs (\n           id, project_id, media_asset_id, operation, parameters, status, current_attempt_number\n         ) VALUES ($1, $2, $3, 'extract_metadata', '{}'::jsonb, 'queued', 0);`,
         [jobId, testProjectId, assetId]
       );
 
@@ -482,16 +546,12 @@ describe('FFprobe Metadata Extraction Suite', () => {
       const storageKey = `media/${testProjectId}/${assetId}/missing.mp4`;
 
       await pool.query(
-        `INSERT INTO media_assets (
-           id, project_id, original_filename, mime_type, file_size_bytes, uploaded_bytes, storage_key, status
-         ) VALUES ($1, $2, 'missing.mp4', 'video/mp4', 1000, 1000, $3, 'ready');`,
+        `INSERT INTO media_assets (\n           id, project_id, original_filename, mime_type, file_size_bytes, uploaded_bytes, storage_key, status\n         ) VALUES ($1, $2, 'missing.mp4', 'video/mp4', 1000, 1000, $3, 'ready');`,
         [assetId, testProjectId, storageKey]
       );
 
       await pool.query(
-        `INSERT INTO processing_jobs (
-           id, project_id, media_asset_id, operation, parameters, status, current_attempt_number
-         ) VALUES ($1, $2, $3, 'extract_metadata', '{}'::jsonb, 'queued', 0);`,
+        `INSERT INTO processing_jobs (\n           id, project_id, media_asset_id, operation, parameters, status, current_attempt_number\n         ) VALUES ($1, $2, $3, 'extract_metadata', '{}'::jsonb, 'queued', 0);`,
         [jobId, testProjectId, assetId]
       );
 
@@ -534,16 +594,12 @@ describe('FFprobe Metadata Extraction Suite', () => {
       await copyFile(VALID_SAMPLE_MP4, destPath);
 
       await pool.query(
-        `INSERT INTO media_assets (
-           id, project_id, original_filename, mime_type, file_size_bytes, uploaded_bytes, storage_key, status
-         ) VALUES ($1, $2, 'persistence_fail.mp4', 'video/mp4', 48796, 48796, $3, 'ready');`,
+        `INSERT INTO media_assets (\n           id, project_id, original_filename, mime_type, file_size_bytes, uploaded_bytes, storage_key, status\n         ) VALUES ($1, $2, 'persistence_fail.mp4', 'video/mp4', 48796, 48796, $3, 'ready');`,
         [assetId, testProjectId, storageKey]
       );
 
       await pool.query(
-        `INSERT INTO processing_jobs (
-           id, project_id, media_asset_id, operation, parameters, status, current_attempt_number
-         ) VALUES ($1, $2, $3, 'extract_metadata', '{}'::jsonb, 'queued', 0);`,
+        `INSERT INTO processing_jobs (\n           id, project_id, media_asset_id, operation, parameters, status, current_attempt_number\n         ) VALUES ($1, $2, $3, 'extract_metadata', '{}'::jsonb, 'queued', 0);`,
         [jobId, testProjectId, assetId]
       );
 

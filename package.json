@@ -9,13 +9,16 @@
     "outbox:publisher": "node --env-file-if-exists=.env --import tsx src/workers/outbox-publisher.ts",
     "job:test": "node --env-file-if-exists=.env --import tsx src/scripts/submit-test-job.ts",
     "typecheck": "tsc --noEmit",
-    "test": "PGDATABASE=lumen_test node --env-file-if-exists=.env --import tsx --test --test-concurrency=1 'src/**/*.test.ts'",
+    "test": "node --import tsx src/test/run-tests.ts unit",
     "db:migrate": "node --env-file-if-exists=.env node_modules/.bin/node-pg-migrate up",
     "db:migrate:down": "node --env-file-if-exists=.env node_modules/.bin/node-pg-migrate down",
     "db:migrate:status": "node --env-file-if-exists=.env --import tsx src/database/migrate-status.ts",
     "migrate:up": "npm run db:migrate",
     "migrate:down": "npm run db:migrate:down",
-    "migrate:status": "npm run db:migrate:status"
+    "migrate:status": "npm run db:migrate:status",
+    "test:integration": "node --import tsx src/test/run-tests.ts integration",
+    "test:integration:check": "node --import tsx src/test/check-integration.ts",
+    "test:integration:migrate": "node --import tsx src/test/migrate-test.ts"
   },
   "keywords": [],
   "author": "",

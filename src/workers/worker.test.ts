@@ -1,3 +1,4 @@
+import '../test/integration-preload.js';
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { QueueEvents, type Job } from 'bullmq';

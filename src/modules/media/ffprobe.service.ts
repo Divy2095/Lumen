@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { executableSetting, integerSetting, MAX_CAPTURE_BYTES, MAX_TIMER_MS } from '../../config/media-processing.js';
 
 export interface FFprobeOptions {
   ffprobePath?: string | undefined;
@@ -8,6 +9,7 @@ export interface FFprobeOptions {
 
 export interface ExtractedMediaMetadata {
   containerFormat: string;
+  containerBrand?: string | undefined;
   durationSeconds: number;
   fileSizeBytes: number;
   bitrate: number | null;
@@ -18,6 +20,7 @@ export interface ExtractedMediaMetadata {
     frameRate: number;
     pixelFormat: string;
     bitrate?: number | null | undefined;
+    rotation?: number | undefined;
   };
   audio?: {
     codec: string;
@@ -89,12 +92,63 @@ export function parseFrameRate(rFrameRate?: string, avgFrameRate?: string): numb
 export function parseDuration(formatDuration?: string, streamDuration?: string): number {
   for (const durStr of [formatDuration, streamDuration]) {
     if (!durStr || typeof durStr !== 'string') continue;
-    const val = parseFloat(durStr);
+    const val = Number(durStr);
     if (Number.isFinite(val) && val > 0 && val <= 86400 * 7) {
       return Math.round(val * 1000) / 1000;
     }
   }
   throw new InvalidMediaError('Unable to determine valid media duration from container or video stream');
+}
+
+/**
+ * Extracts and normalizes video stream rotation in degrees (0..359).
+ *
+ * Rotation can be embedded in:
+ * 1. Stream side data list (modern MP4/QuickTime with 'Display Matrix' side data type and numeric rotation)
+ * 2. Video stream tags ('rotate' tag as string, e.g. "90")
+ * 3. Container format tags (fallback 'rotate' tag as string)
+ */
+export function parseRotation(videoStream?: any, format?: any): number {
+  // 1. Inspect stream side_data_list for Display Matrix (modern standard)
+  if (Array.isArray(videoStream?.side_data_list)) {
+    const displayMatrix = videoStream.side_data_list.find(
+      (sd: any) =>
+        sd &&
+        typeof sd === 'object' &&
+        (sd.side_data_type === 'Display Matrix' || sd.side_data_type === 'displaymatrix')
+    );
+    if (
+      displayMatrix &&
+      typeof displayMatrix.rotation === 'number' &&
+      Number.isFinite(displayMatrix.rotation)
+    ) {
+      return ((Math.round(displayMatrix.rotation) % 360) + 360) % 360;
+    }
+  }
+
+  // 2. Inspect video stream tags for legacy rotate tag
+  if (videoStream?.tags && typeof videoStream.tags === 'object') {
+    const rawVal = videoStream.tags.rotate ?? videoStream.tags.ROTATE;
+    if (rawVal !== undefined && rawVal !== null) {
+      const parsed = parseFloat(String(rawVal));
+      if (Number.isFinite(parsed)) {
+        return ((Math.round(parsed) % 360) + 360) % 360;
+      }
+    }
+  }
+
+  // 3. Inspect container format tags as fallback
+  if (format?.tags && typeof format.tags === 'object') {
+    const rawVal = format.tags.rotate ?? format.tags.ROTATE;
+    if (rawVal !== undefined && rawVal !== null) {
+      const parsed = parseFloat(String(rawVal));
+      if (Number.isFinite(parsed)) {
+        return ((Math.round(parsed) % 360) + 360) % 360;
+      }
+    }
+  }
+
+  return 0;
 }
 
 export class FFprobeService {
@@ -103,9 +157,9 @@ export class FFprobeService {
   readonly maxBufferBytes: number;
 
   constructor(options: FFprobeOptions = {}) {
-    this.ffprobePath = options.ffprobePath ?? (process.env.FFPROBE_PATH || 'ffprobe');
-    this.timeoutMs = options.timeoutMs ?? (process.env.FFPROBE_TIMEOUT_MS ? parseInt(process.env.FFPROBE_TIMEOUT_MS, 10) : 10000);
-    this.maxBufferBytes = options.maxBufferBytes ?? (process.env.FFPROBE_MAX_BUFFER_BYTES ? parseInt(process.env.FFPROBE_MAX_BUFFER_BYTES, 10) : 1024 * 1024);
+    this.ffprobePath = executableSetting('FFPROBE_PATH', options.ffprobePath, 'ffprobe');
+    this.timeoutMs = integerSetting('FFPROBE_TIMEOUT_MS', options.timeoutMs, 10000, MAX_TIMER_MS);
+    this.maxBufferBytes = integerSetting('FFPROBE_MAX_BUFFER_BYTES', options.maxBufferBytes, 1024 * 1024, MAX_CAPTURE_BYTES);
   }
 
   /**
@@ -231,7 +285,7 @@ export class FFprobeService {
       throw new InvalidMediaError('Malformed FFprobe output: output is not valid JSON');
     }
 
-    if (!parsed || typeof parsed !== 'object' || !parsed.format || !Array.isArray(parsed.streams)) {
+    if (!parsed || typeof parsed !== 'object' || !parsed.format || typeof parsed.format !== 'object' || Array.isArray(parsed.format) || !Array.isArray(parsed.streams)) {
       throw new InvalidMediaError('Malformed FFprobe JSON structure: missing format or streams array');
     }
 
@@ -246,15 +300,15 @@ export class FFprobeService {
     // 2. Validate video dimensions
     const width = Number(videoStream.width);
     const height = Number(videoStream.height);
-    if (!Number.isInteger(width) || width <= 0 || width > 16384) {
+    if (!['string', 'number'].includes(typeof videoStream.width) || !Number.isInteger(width) || width <= 0 || width > 16384) {
       throw new InvalidMediaError(`Invalid video width: ${videoStream.width}`);
     }
-    if (!Number.isInteger(height) || height <= 0 || height > 16384) {
+    if (!['string', 'number'].includes(typeof videoStream.height) || !Number.isInteger(height) || height <= 0 || height > 16384) {
       throw new InvalidMediaError(`Invalid video height: ${videoStream.height}`);
     }
 
     // 3. Validate video codec
-    if (!videoStream.codec_name || typeof videoStream.codec_name !== 'string') {
+    if (typeof videoStream.codec_name !== 'string' || !videoStream.codec_name.trim()) {
       throw new InvalidMediaError('Missing or invalid video codec');
     }
     const videoCodec = videoStream.codec_name.slice(0, 50);
@@ -287,7 +341,10 @@ export class FFprobeService {
     // 8. Parse audio stream if present
     const audioStream = parsed.streams.find((s: any) => s && s.codec_type === 'audio');
     let audioMetadata: ExtractedMediaMetadata['audio'] = undefined;
-    if (audioStream && audioStream.codec_name) {
+    if (audioStream) {
+      if (typeof audioStream.codec_name !== 'string' || !audioStream.codec_name.trim()) {
+        throw new InvalidMediaError('Missing or invalid audio codec');
+      }
       const sampleRate = audioStream.sample_rate ? parseInt(String(audioStream.sample_rate), 10) : 0;
       const channels = typeof audioStream.channels === 'number'
         ? audioStream.channels
@@ -303,7 +360,14 @@ export class FFprobeService {
       };
     }
 
-    const containerFormat = String(parsed.format.format_name || 'unknown').slice(0, 100);
+    // 9. Parse rotation from Display Matrix side data, stream tags, or format tags
+    const rotation = parseRotation(videoStream, parsed.format);
+
+    if (typeof parsed.format.format_name !== 'string' || !parsed.format.format_name.trim()) {
+      throw new InvalidMediaError('Missing or invalid container format');
+    }
+    const containerFormat = parsed.format.format_name.slice(0, 100);
+    const containerBrand = typeof parsed.format.tags?.major_brand === 'string' ? parsed.format.tags.major_brand.trim() : undefined;
     const pixelFormat = String(videoStream.pix_fmt || 'unknown').slice(0, 50);
 
     const rawMetadata: Record<string, any> = {
@@ -318,6 +382,7 @@ export class FFprobeService {
         aspect_ratio: videoStream.display_aspect_ratio ?? null,
         pixel_format: pixelFormat,
         r_frame_rate: videoStream.r_frame_rate ?? null,
+        rotation,
       },
       audio: audioMetadata ? {
         codec: audioMetadata.codec,
@@ -330,6 +395,7 @@ export class FFprobeService {
 
     return {
       containerFormat,
+      containerBrand,
       durationSeconds,
       fileSizeBytes,
       bitrate,
@@ -340,6 +406,7 @@ export class FFprobeService {
         frameRate,
         pixelFormat,
         bitrate: videoStream.bit_rate ? parseInt(String(videoStream.bit_rate), 10) : null,
+        rotation,
       },
       audio: audioMetadata,
       rawMetadata,

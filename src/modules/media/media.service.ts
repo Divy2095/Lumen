@@ -8,8 +8,18 @@ import {
   type MediaAssetPublic,
   type ClaimUploadResult,
   type ThumbnailInfo,
+  type TranscodingStatusInfo,
+  type TranscodingRenditionInfo,
+  type RenditionDeliveryResult,
   InvalidStateTransitionError,
 } from './media.types.js';
+import {
+  validateTranscodingConfig,
+  InvalidTranscodingConfigError,
+  type TranscodingConfig,
+  type SkippedProfile,
+  type TranscodingProfileName,
+} from './transcoding-profiles.js';
 
 export class MediaService {
   constructor(private db: Pool) {}
@@ -23,12 +33,20 @@ export class MediaService {
   ): Promise<RegisterMediaResponse> {
     const assetId = uuidv7();
     const config = getStorageConfig();
-    const { token: uploadToken, hash: uploadTokenHash } = generateUploadToken();
 
-    // Logical opaque storage key
+    const { token: uploadToken, hash: uploadTokenHash } = generateUploadToken();
+    const expiresAt = new Date(Date.now() + config.uploadTokenTtlSeconds * 1000);
     const storageKey = `media/${projectId}/${assetId}/original.mp4`;
 
-    const expiresAt = new Date(Date.now() + config.uploadTokenTtlSeconds * 1000);
+    // Validate transcoding configuration if supplied
+    let transcodingConfig: TranscodingConfig | null = null;
+    if (input.transcoding !== undefined) {
+      const validation = validateTranscodingConfig(input.transcoding);
+      if (!validation.valid) {
+        throw new InvalidTranscodingConfigError(validation.error!);
+      }
+      transcodingConfig = validation.config ?? null;
+    }
 
     const query = `
       INSERT INTO media_assets (
@@ -41,12 +59,13 @@ export class MediaService {
         upload_token_hash,
         upload_token_expires_at,
         storage_key,
+        transcoding_config,
         status,
         created_at,
         updated_at
       )
-      VALUES ($1, $2, $3, $4, $5, 0, $6, $7, $8, 'uploading', NOW(), NOW())
-      RETURNING id, project_id, status, original_filename, mime_type, file_size_bytes, uploaded_bytes, created_at;
+      VALUES ($1, $2, $3, $4, $5, 0, $6, $7, $8, $9, 'uploading', NOW(), NOW())
+      RETURNING id, project_id, status, original_filename, mime_type, file_size_bytes, uploaded_bytes, transcoding_config, created_at;
     `;
 
     const result = await this.db.query<{
@@ -57,6 +76,7 @@ export class MediaService {
       mime_type: string;
       file_size_bytes: string;
       uploaded_bytes: string;
+      transcoding_config: TranscodingConfig | null;
       created_at: Date;
     }>(query, [
       assetId,
@@ -67,6 +87,7 @@ export class MediaService {
       uploadTokenHash,
       expiresAt.toISOString(),
       storageKey,
+      transcodingConfig ? JSON.stringify(transcodingConfig) : null,
     ]);
 
     const row = result.rows[0]!;
@@ -83,6 +104,7 @@ export class MediaService {
       upload_url: `/v1/media/${row.id}/upload`,
       upload_expires_at: expiresAt.toISOString(),
       created_at: row.created_at.toISOString(),
+      transcoding_config: row.transcoding_config ?? undefined,
     };
   }
 
@@ -129,15 +151,16 @@ export class MediaService {
     }
 
     // Check active token match
-    if (row.upload_token_hash && row.upload_token_hash === tokenHash) {
+    if (row.upload_token_hash === tokenHash) {
       if (row.upload_token_expires_at && row.upload_token_expires_at.getTime() <= Date.now()) {
         return { claimed: false, reason: 'expired' };
       }
-
       if (row.status !== 'uploading') {
-        return { claimed: false, reason: 'in_progress_or_consumed' };
+        return {
+          claimed: false,
+          reason: row.status === 'ready' ? 'already_uploaded' : 'in_progress_or_consumed',
+        };
       }
-
       return {
         claimed: true,
         asset: {
@@ -149,38 +172,42 @@ export class MediaService {
       };
     }
 
-    // Check if this token was previously consumed for this asset
-    if (row.consumed_token_hash && row.consumed_token_hash === tokenHash) {
-      if (row.status === 'ready') {
-        return { claimed: false, reason: 'already_uploaded' };
-      }
-      return { claimed: false, reason: 'in_progress_or_consumed' };
+    // Check if token was already consumed
+    if (row.consumed_token_hash === tokenHash) {
+      return {
+        claimed: false,
+        reason: row.status === 'ready' ? 'already_uploaded' : 'in_progress_or_consumed',
+      };
     }
 
-    // Credential does not match active or consumed token for this asset
+    // Neither matches: invalid token
     return { claimed: false, reason: 'invalid_token' };
   }
 
   /**
-   * Atomically claims an asset for upload and records the consumed token hash in metadata.
+   * Atomically claims an upload token.
+   * Invalidates upload_token_hash and records consumed_token_hash in metadata.
+   * Returns false with specific reason if the token is invalid, expired, or already consumed.
    */
-  async claimUploadToken(
-    assetId: string,
-    rawUploadToken: string
-  ): Promise<ClaimUploadResult> {
+  async claimUploadToken(assetId: string, rawUploadToken: string): Promise<ClaimUploadResult> {
     const tokenHash = hashSha256(rawUploadToken);
 
-    // Atomically consume token and persist hash in metadata for replay detection
     const query = `
       UPDATE media_assets
-      SET upload_token_hash = NULL,
-          upload_token_expires_at = NULL,
-          metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{consumed_token_hash}', to_jsonb($2::text)),
-          updated_at = NOW()
-      WHERE id = $1
-        AND upload_token_hash = $2
-        AND upload_token_expires_at > NOW()
+      SET
+        upload_token_hash = NULL,
+        upload_token_expires_at = NULL,
+        metadata = jsonb_set(
+          COALESCE(metadata, '{}'::jsonb),
+          '{consumed_token_hash}',
+          to_jsonb($2::text)
+        ),
+        updated_at = NOW()
+      WHERE
+        id = $1
         AND status = 'uploading'
+        AND upload_token_hash = $2
+        AND (upload_token_expires_at IS NULL OR upload_token_expires_at > NOW())
       RETURNING id, project_id, file_size_bytes, storage_key;
     `;
 
@@ -204,23 +231,31 @@ export class MediaService {
       };
     }
 
-    // Determine reason for failure
+    // Determine why claim failed
     return this.inspectClaimFailure(assetId, tokenHash);
   }
 
   private async inspectClaimFailure(assetId: string, tokenHash: string): Promise<ClaimUploadResult> {
-    const checkQuery = `
-      SELECT status, upload_token_expires_at, metadata->>'consumed_token_hash' AS consumed_token_hash
+    const inspectQuery = `
+      SELECT
+        id,
+        status,
+        upload_token_hash,
+        upload_token_expires_at,
+        metadata->>'consumed_token_hash' AS consumed_token_hash
       FROM media_assets
       WHERE id = $1;
     `;
-    const checkResult = await this.db.query<{
+
+    const result = await this.db.query<{
+      id: string;
       status: string;
+      upload_token_hash: string | null;
       upload_token_expires_at: Date | null;
       consumed_token_hash: string | null;
-    }>(checkQuery, [assetId]);
+    }>(inspectQuery, [assetId]);
 
-    const row = checkResult.rows[0];
+    const row = result.rows[0];
     if (!row) {
       return { claimed: false, reason: 'invalid_token' };
     }
@@ -257,13 +292,13 @@ export class MediaService {
       // 1. Transition media asset from 'uploading' to 'ready'
       const updateAssetQuery = `
         UPDATE media_assets
-        SET status = 'ready',
-            uploaded_bytes = $2,
-            upload_token_hash = NULL,
-            upload_token_expires_at = NULL,
-            updated_at = NOW()
+        SET status = 'ready',\
+            uploaded_bytes = $2,\
+            upload_token_hash = NULL,\
+            upload_token_expires_at = NULL,\
+            updated_at = NOW()\
         WHERE id = $1 AND status = 'uploading'
-        RETURNING id, project_id, status, original_filename, mime_type, file_size_bytes, uploaded_bytes, created_at, updated_at;
+        RETURNING id, project_id, status, original_filename, mime_type, file_size_bytes, uploaded_bytes, transcoding_config, created_at, updated_at;
       `;
 
       const assetResult = await client.query<{
@@ -274,6 +309,7 @@ export class MediaService {
         mime_type: string;
         file_size_bytes: string;
         uploaded_bytes: string;
+        transcoding_config: TranscodingConfig | null;
         created_at: Date;
         updated_at: Date;
       }>(updateAssetQuery, [assetId, uploadedBytes]);
@@ -345,7 +381,6 @@ export class MediaService {
           operation: job.operation,
           parameters: job.parameters,
         };
-
         await client.query(insertOutboxQuery, [
           outboxEventId,
           job.id,
@@ -355,7 +390,7 @@ export class MediaService {
 
       await client.query('COMMIT');
 
-      return {
+      const publicAsset: MediaAssetPublic = {
         id: assetRow.id,
         project_id: assetRow.project_id,
         status: assetRow.status,
@@ -366,6 +401,12 @@ export class MediaService {
         created_at: assetRow.created_at.toISOString(),
         updated_at: assetRow.updated_at.toISOString(),
       };
+
+      if (assetRow.transcoding_config !== null && assetRow.transcoding_config !== undefined) {
+        publicAsset.transcoding_config = assetRow.transcoding_config;
+      }
+
+      return publicAsset;
     } catch (err) {
       await client.query('ROLLBACK').catch(() => {});
       throw err;
@@ -375,39 +416,34 @@ export class MediaService {
   }
 
   /**
-   * Checks current asset status in PostgreSQL.
+   * Checks current asset status.
    */
   async checkAssetStatus(assetId: string): Promise<string | null> {
-    const result = await this.db.query<{ status: string }>(
-      `SELECT status FROM media_assets WHERE id = $1;`,
-      [assetId]
-    );
+    const query = `
+      SELECT status
+      FROM media_assets
+      WHERE id = $1;
+    `;
+    const result = await this.db.query<{ status: string }>(query, [assetId]);
     return result.rows[0]?.status ?? null;
   }
 
   /**
-   * Checks whether an asset is currently in an active 'uploading' state.
-   * Used during startup cleanup to guarantee active upload temp files are never deleted.
+   * Checks whether an asset is actively in 'uploading' status.
    */
   async isAssetActivelyUploading(assetId: string): Promise<boolean> {
-    try {
-      const query = `
-        SELECT 1
-        FROM media_assets
-        WHERE id = $1
-          AND status = 'uploading'
-          AND updated_at > NOW() - INTERVAL '2 hours';
-      `;
-      const result = await this.db.query(query, [assetId]);
-      return result.rowCount !== null && result.rowCount > 0;
-    } catch {
-      // Conservative fallback: on DB error, assume active to prevent accidental deletion
-      return true;
-    }
+    const query = `
+      SELECT 1
+      FROM media_assets
+      WHERE id = $1
+        AND status = 'uploading';
+    `;
+    const result = await this.db.query(query, [assetId]);
+    return result.rowCount !== null && result.rowCount > 0;
   }
 
   /**
-   * Marks media asset as terminal failed and destroys any token.
+   * Transitions an asset from 'uploading' to 'failed' on unrecoverable stream error.
    */
   async markUploadFailed(assetId: string): Promise<void> {
     const query = `
@@ -434,6 +470,8 @@ export class MediaService {
         mime_type,
         file_size_bytes,
         uploaded_bytes,
+        transcoding_config,
+        metadata,
         created_at,
         updated_at
       FROM media_assets
@@ -448,6 +486,8 @@ export class MediaService {
       mime_type: string;
       file_size_bytes: string;
       uploaded_bytes: string;
+      transcoding_config: TranscodingConfig | null;
+      metadata: Record<string, any> | null;
       created_at: Date;
       updated_at: Date;
     }>(query, [assetId, projectId]);
@@ -505,6 +545,83 @@ export class MediaService {
       }
     }
 
+    // Query processing_jobs for transcode operations
+    const transcodeJobsQuery = `
+      SELECT id, status, parameters, completed_at
+      FROM processing_jobs
+      WHERE media_asset_id = $1 AND operation = 'transcode'
+      ORDER BY created_at ASC;
+    `;
+    const transcodeJobsResult = await this.db.query<{
+      id: string;
+      status: string;
+      parameters: any;
+      completed_at: Date | null;
+    }>(transcodeJobsQuery, [assetId]);
+
+    // Query current rendition outputs from media_outputs
+    const currentOutputsRes = await this.db.query<{
+      logical_key: string;
+      version: number;
+      storage_key: string;
+      mime_type: string;
+      file_size_bytes: string;
+      width: number | null;
+      height: number | null;
+      created_at: Date;
+    }>(
+      `SELECT logical_key, version, storage_key, mime_type, file_size_bytes, width, height, created_at
+       FROM media_outputs
+       WHERE media_asset_id = $1 AND output_type = 'rendition' AND is_current = true;`,
+      [assetId]
+    );
+
+    const currentOutputsMap = new Map(
+      currentOutputsRes.rows.map((r) => [r.logical_key, r])
+    );
+
+    const meta = row.metadata;
+    const transcodeMeta = meta?.transcoding;
+    const skippedProfiles = (transcodeMeta?.skipped ?? meta?.skipped_profiles) as SkippedProfile[] | undefined;
+
+    let transcoding: TranscodingStatusInfo | undefined = undefined;
+
+    if (transcodeJobsResult.rows.length > 0 || (skippedProfiles && skippedProfiles.length > 0) || transcodeMeta) {
+      const renditions: TranscodingRenditionInfo[] = transcodeJobsResult.rows.map((r) => {
+        const params = typeof r.parameters === 'string' ? JSON.parse(r.parameters) : r.parameters;
+        const profile = params?.profile as TranscodingProfileName;
+        const matchingOutput = currentOutputsMap.get(`rendition_${profile}`);
+
+        const rendition: TranscodingRenditionInfo = {
+          profile,
+          status: r.status,
+          target_width: params?.targetWidth,
+          target_height: params?.targetHeight,
+          job_id: r.id,
+        };
+
+        if (matchingOutput && r.status === 'completed') {
+          rendition.width = matchingOutput.width ?? undefined;
+          rendition.height = matchingOutput.height ?? undefined;
+          rendition.file_size_bytes = Number(matchingOutput.file_size_bytes);
+          rendition.mime_type = matchingOutput.mime_type;
+          rendition.version = matchingOutput.version;
+          rendition.completed_at = r.completed_at
+            ? r.completed_at.toISOString()
+            : matchingOutput.created_at.toISOString();
+          rendition.url = `/v1/media/${assetId}/renditions/${profile}`;
+        }
+
+        return rendition;
+      });
+
+      transcoding = {
+        mode: transcodeMeta?.mode,
+        skipped: skippedProfiles ?? [],
+        renditions,
+      };
+    }
+
     const publicAsset: MediaAssetPublic = {
       id: row.id,
       project_id: row.project_id,
@@ -517,8 +634,20 @@ export class MediaService {
       updated_at: row.updated_at.toISOString(),
     };
 
+    if (row.transcoding_config !== null && row.transcoding_config !== undefined) {
+      publicAsset.transcoding_config = row.transcoding_config;
+    }
+
     if (thumbnail !== undefined) {
       publicAsset.thumbnail = thumbnail;
+    }
+
+    if (transcoding !== undefined) {
+      publicAsset.transcoding = transcoding;
+    }
+
+    if (skippedProfiles && skippedProfiles.length > 0) {
+      publicAsset.skipped_profiles = skippedProfiles;
     }
 
     return publicAsset;
@@ -557,5 +686,88 @@ export class MediaService {
       mimeType: row.mime_type,
       fileSizeBytes: Number(row.file_size_bytes),
     };
+  }
+
+  /**
+   * Retrieves current rendition delivery info and metadata for an authorized media asset.
+   */
+  async getRendition(
+    projectId: string,
+    assetId: string,
+    profile: string
+  ): Promise<RenditionDeliveryResult> {
+    const validProfiles = ['360p', '480p', '720p', '1080p'];
+    if (!validProfiles.includes(profile)) {
+      return { status: 'invalid_profile' };
+    }
+
+    // Verify media asset exists and belongs to project
+    const assetRes = await this.db.query<{ id: string }>(
+      `SELECT id FROM media_assets WHERE id = $1 AND project_id = $2;`,
+      [assetId, projectId]
+    );
+    if (!assetRes.rows[0]) {
+      return { status: 'asset_not_found' };
+    }
+
+    const logicalKey = `rendition_${profile}`;
+
+    // Query current output and transcode job status
+    const outputQuery = `
+      SELECT
+        mo.storage_key,
+        mo.mime_type,
+        mo.file_size_bytes,
+        mo.width,
+        mo.height,
+        mo.version,
+        pj.status AS job_status
+      FROM processing_jobs pj
+      LEFT JOIN media_outputs mo ON mo.media_asset_id = pj.media_asset_id
+                                 AND mo.logical_key = $2
+                                 AND mo.is_current = true
+      WHERE pj.media_asset_id = $1
+        AND pj.operation = 'transcode'
+        AND pj.parameters->>'profile' = $3
+      ORDER BY pj.created_at DESC
+      LIMIT 1;
+    `;
+
+    const result = await this.db.query<{
+      storage_key: string | null;
+      mime_type: string | null;
+      file_size_bytes: string | null;
+      width: number | null;
+      height: number | null;
+      version: number | null;
+      job_status: string;
+    }>(outputQuery, [assetId, logicalKey, profile]);
+
+    const row = result.rows[0];
+    if (!row) {
+      return { status: 'not_found' };
+    }
+
+    if (row.storage_key && row.file_size_bytes) {
+      return {
+        status: 'ready',
+        storageKey: row.storage_key,
+        mimeType: row.mime_type ?? 'video/mp4',
+        fileSizeBytes: Number(row.file_size_bytes),
+        width: row.width ?? undefined,
+        height: row.height ?? undefined,
+        version: row.version ?? undefined,
+      };
+    }
+
+    if (row.job_status === 'queued' || row.job_status === 'processing') {
+      return { status: 'processing' };
+    }
+
+    if (row.job_status === 'failed') {
+      return { status: 'failed' };
+    }
+
+    return { status: 'not_found' };
   }
 }

@@ -13,10 +13,10 @@ Current stack:
 - Docker Compose
 - npm
 
-Planned components:
+Implemented processing components:
 - Redis and BullMQ
 - FFmpeg and FFprobe
-- Local filesystem initially, S3 later
+- Contained local filesystem storage (S3 remains planned)
 
 ## Engineering Principles
 
@@ -66,15 +66,25 @@ Do not claim tests passed unless they were actually executed.
 
 ## Current Development Stage
 
-The following are already implemented:
-- Fastify application foundation
-- Docker Compose PostgreSQL infrastructure
-- PostgreSQL connection pool
-- Fastify database plugin
-- /health liveness endpoint
-- /ready database readiness endpoint
+Milestone 3.5.3 implements video transcoding on the existing ingestion pipeline:
+- Fastify API with API-key/project ownership checks and single-use upload tokens.
+- PostgreSQL schema and migrations 001/002; transactional outbox scheduling.
+- Redis/BullMQ publisher and workers; metadata, thumbnails, and MP4 renditions.
+- Rotation-aware profiles without upscaling; validated H.264/AAC output.
+- Renewed/fenced transcode leases, safe redelivery, contained storage, non-overwriting
+  publication, temporary cleanup, and conservative uncertain-COMMIT handling.
 
-The next planned milestone is database schema design.
+Batch 4B historically passed 336 integration cases with 2,239 assertion calls in a
+separate disposable cluster. Final HTTP corrections are checked with database-free
+regressions; do not describe the historical suite as rerun after those changes.
 
-Do not start implementing schema or migrations without first discussing
-the entities, relationships, constraints, and lifecycle requirements.
+Use npm test for explicitly classified database-free files. Guarded integration
+commands require separate authorization to create disposable infrastructure and
+execute destructive setup. Never reuse development databases, Redis, or storage.
+See docs/isolated-integration-tests.md and docs/batch-4b-verification.md.
+
+Credential provisioning has no supported public endpoint/CLI yet. Signed webhooks,
+HTTP Range/206 support, orphan reconciliation, and production load verification
+remain outstanding. Do not invent a next milestone number or implement these
+without discussing scope. Discuss entities, constraints, and lifecycle requirements
+before adding or changing schema/migrations.

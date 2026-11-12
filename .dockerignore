@@ -1,0 +1,13 @@
+.git
+.env
+.env.*
+node_modules
+storage
+storage_test
+storage_ffmpeg_test
+storage_ffprobe_test
+.agents
+.codex
+.aws
+skills
+!.env.integration.example

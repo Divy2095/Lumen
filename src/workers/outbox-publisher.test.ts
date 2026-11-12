@@ -1,12 +1,13 @@
+import '../test/integration-preload.js';
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { copyFile, mkdir } from 'node:fs/promises';
 import { resolve, dirname } from 'node:path';
 import { Queue, QueueEvents } from 'bullmq';
-import { Pool } from 'pg';
+import { TestPool as Pool } from '../test/db-guard.js';
 import { uuidv7 } from 'uuidv7';
 import { assertTestDatabase } from '../test/db-guard.js';
-import { createDatabasePool } from '../database/pool.js';
+import { createTestPool as createDatabasePool } from '../test/db-guard.js';
 import {
   createRedisConnection,
   closeRedisConnection,
@@ -23,6 +24,7 @@ import {
 import { OutboxPublisher } from './outbox-publisher.js';
 import { createMediaWorker, type WorkerLogger } from './worker.js';
 import { processJob } from './processor.js';
+import { RetryProcessingError } from './job-lease.js';
 import { defaultStorageService } from '../shared/storage/local-storage.service.js';
 
 describe('Transactional Outbox Integration Suite (Milestone 3.2)', () => {
@@ -637,17 +639,19 @@ describe('Transactional Outbox Integration Suite (Milestone 3.2)', () => {
       } as any;
 
       // Run two workers concurrently attempting to process the exact same job
-      const [result1, result2] = await Promise.all([
+      const results = await Promise.allSettled([
         processJob(mockJob, pool, { workerId: 'worker-A' }),
         processJob(mockJob, pool, { workerId: 'worker-B' }),
       ]);
-
-      const results = [result1, result2];
-      const completedCount = results.filter((r: any) => r.status === 'completed').length;
-      const alreadyCompletedCount = results.filter((r: any) => r.status === 'already_completed').length;
-
-      assert.strictEqual(completedCount, 1, 'Exactly one worker should claim and complete the job');
-      assert.strictEqual(alreadyCompletedCount, 1, 'The competing worker should cleanly observe already_completed');
+      const completed = results.filter((r) => r.status === 'fulfilled' && 'status' in r.value && r.value.status === 'completed');
+      assert.strictEqual(completed.length, 1, 'Exactly one worker should claim and complete the job');
+      for (const result of results) {
+        if (result.status === 'rejected') assert.ok(result.reason instanceof RetryProcessingError);
+        else assert.ok('status' in result.value && ['completed', 'already_completed'].includes(result.value.status));
+      }
+      // Only a subsequent delivery after confirmed completion may acknowledge completion.
+      const redelivered = await processJob(mockJob, pool);
+      assert.strictEqual('status' in redelivered && redelivered.status, 'already_completed');
 
       // Verify job in database is completed and has current_attempt_number = 1
       const jobRes = await pool.query<{ status: string; current_attempt_number: number }>(

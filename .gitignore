@@ -8,5 +8,6 @@ coverage/
 .DS_Store
 skills
 AGENTS.md
-storage/
+/storage/
 storage_test/
+!.env.integration.example

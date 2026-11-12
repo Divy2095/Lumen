@@ -1,8 +1,10 @@
+import '../../test/integration-preload.js';
+import { testStorageDirectory, removeTestStorage } from '../../test/test-environment.js';
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { resolve } from 'node:path';
 import { copyFile, mkdir, rm, readFile, readdir, stat } from 'node:fs/promises';
-import { Pool } from 'pg';
+import { TestPool as Pool } from '../../test/db-guard.js';
 import { uuidv7 } from 'uuidv7';
 import { type Job } from 'bullmq';
 import {
@@ -32,7 +34,7 @@ const VALID_SAMPLE_MP4 = resolve(FIXTURES_DIR, 'valid_sample.mp4');
 const SHORT_SAMPLE_MP4 = resolve(FIXTURES_DIR, 'short_sample.mp4');
 const AUDIO_ONLY_MP4 = resolve(FIXTURES_DIR, 'audio_only.mp4');
 const CORRUPT_MP4 = resolve(FIXTURES_DIR, 'corrupt.mp4');
-const TEST_STORAGE_DIR = resolve('storage_ffmpeg_test');
+const TEST_STORAGE_DIR = testStorageDirectory('ffmpeg-service');
 async function fileExistsOnDisk(filePath: string): Promise<boolean> {
   try {
     await stat(filePath);
@@ -307,7 +309,7 @@ describe('FFmpeg Thumbnail Generation Suite (Milestone 3.4)', () => {
         await pool.query(`DELETE FROM accounts WHERE id = $1;`, [testAccountId]).catch(() => {});
         await pool.end();
       }
-      await rm(TEST_STORAGE_DIR, { recursive: true, force: true });
+      await removeTestStorage(TEST_STORAGE_DIR);
     });
 
     it('worker successfully generates thumbnail and persists media_outputs record', async () => {
@@ -1038,7 +1040,7 @@ describe('FFmpeg Thumbnail Generation Suite (Milestone 3.4)', () => {
         await pool.query(`DELETE FROM projects WHERE id IN ($1, $2);`, [projectId, otherProjectId]).catch(() => {});
         await pool.end();
       }
-      await rm(TEST_STORAGE_DIR, { recursive: true, force: true });
+      await removeTestStorage(TEST_STORAGE_DIR);
     });
 
     it('GET /v1/media/:id returns thumbnail metadata when thumbnail is ready', async () => {

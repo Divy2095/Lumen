@@ -5,6 +5,7 @@ import { MediaService } from './media.service.js';
 import { Mp4StreamInspector } from './mp4-validator.js';
 import { defaultStorageService } from '../../shared/storage/local-storage.service.js';
 import { getStorageConfig } from '../../config/storage.js';
+import { InvalidTranscodingConfigError } from './transcoding-profiles.js';
 
 export const mediaRoutes: FastifyPluginAsync = async (fastify) => {
   const mediaService = new MediaService(fastify.db);
@@ -53,6 +54,10 @@ export const mediaRoutes: FastifyPluginAsync = async (fastify) => {
             original_filename: { type: 'string', minLength: 1, maxLength: 255 },
             mime_type: { type: 'string', enum: ['video/mp4'] },
             file_size_bytes: { type: 'integer', minimum: 1, maximum: getStorageConfig().maxUploadSizeBytes },
+            transcoding: {
+              type: 'object',
+              additionalProperties: true,
+            },
           },
         },
       },
@@ -63,18 +68,30 @@ export const mediaRoutes: FastifyPluginAsync = async (fastify) => {
         original_filename: string;
         mime_type: string;
         file_size_bytes: number;
+        transcoding?: any;
       };
 
       // Strip directory path characters to prevent traversal
       const sanitizedFilename = body.original_filename.replace(/^.*[\\/]/, '');
 
-      const asset = await mediaService.registerMedia(project.id, {
-        original_filename: sanitizedFilename,
-        mime_type: body.mime_type,
-        file_size_bytes: body.file_size_bytes,
-      });
+      try {
+        const asset = await mediaService.registerMedia(project.id, {
+          original_filename: sanitizedFilename,
+          mime_type: body.mime_type,
+          file_size_bytes: body.file_size_bytes,
+          transcoding: body.transcoding,
+        });
 
-      return reply.status(201).send(asset);
+        return reply.status(201).send(asset);
+      } catch (err: any) {
+        if (err instanceof InvalidTranscodingConfigError) {
+          return reply.status(400).send({
+            error: 'bad_request',
+            message: err.message,
+          });
+        }
+        throw err;
+      }
     }
   );
 
@@ -481,6 +498,79 @@ export const mediaRoutes: FastifyPluginAsync = async (fastify) => {
         .type(thumbnail.mimeType)
         .header('Content-Length', thumbnail.fileSizeBytes)
         .header('Cache-Control', 'private, max-age=86400')
+        .send(stream);
+    }
+  );
+
+  // GET /v1/media/:id/renditions/:profile (Stream transcoded rendition MP4)
+  fastify.get(
+    '/v1/media/:id/renditions/:profile',
+    {
+      onRequest: async (_request, reply) => { reply.header('Cache-Control', 'no-store'); },
+      preHandler: [(fastify as any).authenticateApiKey],
+      schema: {
+        params: {
+          type: 'object',
+          required: ['id', 'profile'],
+          properties: {
+            id: { type: 'string', pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$' },
+            profile: { type: 'string' },
+          },
+        },
+      },
+    },
+    async (request, reply) => {
+      const project = request.project!;
+      const { id: assetId, profile } = request.params as { id: string; profile: string };
+
+      const rendition = await mediaService.getRendition(project.id, assetId, profile);
+
+      if (rendition.status === 'asset_not_found') {
+        return reply.status(404).send({
+          error: 'media_asset_not_found',
+          message: 'Media asset not found in this project',
+        });
+      }
+
+      if (rendition.status === 'invalid_profile' || rendition.status === 'not_found') {
+        return reply.status(404).send({
+          error: 'rendition_not_found',
+          message: `Rendition "${profile}" not found or not configured for this media asset`,
+        });
+      }
+
+      if (rendition.status === 'processing') {
+        return reply.status(409).send({
+          error: 'rendition_processing',
+          message: `Rendition "${profile}" is currently being processed`,
+        });
+      }
+
+      if (rendition.status === 'failed') {
+        return reply.status(409).send({
+          error: 'rendition_failed',
+          message: `Rendition "${profile}" processing failed`,
+        });
+      }
+
+      // Ready: resolve storage path and check file existence
+      const filePath = defaultStorageService.resolvePath(rendition.storageKey!);
+      const exists = await defaultStorageService.fileExists(filePath);
+      if (!exists) {
+        return reply.status(404).send({
+          error: 'rendition_not_found',
+          message: 'Rendition file is missing from storage',
+        });
+      }
+
+      const stream = createReadStream(filePath);
+      stream.on('error', (err) => {
+        request.log.error({ err }, 'Streaming error occurred while reading rendition file');
+      });
+
+      return reply
+        .type(rendition.mimeType!)
+        .header('Content-Length', rendition.fileSizeBytes!)
         .send(stream);
     }
   );

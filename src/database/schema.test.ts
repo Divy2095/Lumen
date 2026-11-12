@@ -1,8 +1,10 @@
+import '../test/integration-preload.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { DatabaseError, Pool } from 'pg';
+import { DatabaseError } from 'pg';
+import { TestPool as Pool } from '../test/db-guard.js';
 import { uuidv7 } from 'uuidv7';
-import { assertTestDatabase } from '../test/db-guard.js';
+import { assertTestConnection, assertTestDatabase } from '../test/db-guard.js';
 
 const pool = new Pool({
   host: process.env.PGHOST ?? '127.0.0.1',
@@ -537,9 +539,49 @@ test('Schema Validation Suite', async (t) => {
 
     await assert.rejects(
       async () => {
-        await assertTestDatabase(fakeDevPool);
+        await assertTestConnection(fakeDevPool.query.bind(fakeDevPool));
       },
       /CRITICAL DATABASE SAFETY VIOLATION/
     );
+  });
+
+  await t.test('14. Transcoding configuration column (media_assets.transcoding_config JSONB)', async () => {
+    // 1. Column exists in information_schema with data_type 'jsonb'
+    const colRes = await pool.query<{ data_type: string; is_nullable: string }>(`
+      SELECT data_type, is_nullable
+      FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = 'media_assets'
+        AND column_name = 'transcoding_config';
+    `);
+    assert.strictEqual(colRes.rows.length, 1, 'Column transcoding_config must exist in media_assets');
+    assert.strictEqual(colRes.rows[0]?.data_type, 'jsonb');
+    assert.strictEqual(colRes.rows[0]?.is_nullable, 'YES');
+
+    // 2. Inserts with valid JSONB and null both succeed
+    const accRes = await pool.query(`INSERT INTO accounts (email) VALUES ($1) RETURNING id;`, [
+      `transcode-col-${Date.now()}@example.com`,
+    ]);
+    const projRes = await pool.query(
+      `INSERT INTO projects (account_id, name) VALUES ($1, 'Transcode Col Project') RETURNING id;`,
+      [accRes.rows[0]?.id]
+    );
+
+    // Insert with null transcoding_config
+    const nullRes = await pool.query(
+      `INSERT INTO media_assets (project_id, original_filename, mime_type, file_size_bytes, storage_key, transcoding_config)
+       VALUES ($1, 'null_config.mp4', 'video/mp4', 1000, 'k1', NULL) RETURNING id, transcoding_config;`,
+      [projRes.rows[0]?.id]
+    );
+    assert.strictEqual(nullRes.rows[0]?.transcoding_config, null);
+
+    // Insert with jsonb transcoding_config
+    const configObj = { enabled: true, profiles: ['720p', '1080p'] };
+    const jsonRes = await pool.query(
+      `INSERT INTO media_assets (project_id, original_filename, mime_type, file_size_bytes, storage_key, transcoding_config)
+       VALUES ($1, 'json_config.mp4', 'video/mp4', 1000, 'k2', $2::jsonb) RETURNING id, transcoding_config;`,
+      [projRes.rows[0]?.id, JSON.stringify(configObj)]
+    );
+    assert.deepStrictEqual(jsonRes.rows[0]?.transcoding_config, configObj);
   });
 });

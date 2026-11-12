@@ -1,7 +1,9 @@
+import '../../test/integration-preload.js';
+import { testStorageDirectory, removeTestStorage } from '../../test/test-environment.js';
 import { uuidv7 } from 'uuidv7';
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { Pool } from 'pg';
+import { TestPool as Pool } from '../../test/db-guard.js';
 import { rm, writeFile, utimes, mkdir } from 'node:fs/promises';
 import { resolve, dirname } from 'node:path';
 import http from 'node:http';
@@ -13,8 +15,7 @@ import { MediaService } from './media.service.js';
 import { InvalidStateTransitionError } from './media.types.js';
 
 // Dedicated test database
-const TEST_STORAGE_DIR = resolve('storage_test');
-process.env.PGDATABASE = 'lumen_test';
+const TEST_STORAGE_DIR = testStorageDirectory('media');
 process.env.STORAGE_BASE_DIR = TEST_STORAGE_DIR;
 
 const testPool = new Pool({
@@ -98,7 +99,7 @@ describe('Media Ingestion API (Milestone 2)', () => {
   after(async () => {
     await app.close();
     await testPool.end();
-    await rm(TEST_STORAGE_DIR, { recursive: true, force: true });
+    await removeTestStorage(TEST_STORAGE_DIR);
   });
 
   describe('1. API Key Authentication (POST /v1/media)', () => {
@@ -260,6 +261,146 @@ describe('Media Ingestion API (Milestone 2)', () => {
       });
 
       assert.strictEqual(res.statusCode, 400);
+    });
+    it('should successfully register media with valid transcoding configuration', async () => {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/v1/media',
+        headers: { Authorization: `Bearer ${activeApiKey}` },
+        payload: {
+          original_filename: 'transcoded.mp4',
+          mime_type: 'video/mp4',
+          file_size_bytes: 4096,
+          transcoding: {
+            profiles: ['720p', '1080p'],
+          },
+        },
+      });
+
+      assert.strictEqual(res.statusCode, 201);
+      const body = JSON.parse(res.payload);
+      assert.deepStrictEqual(body.transcoding_config, { profiles: ['720p', '1080p'] });
+
+      // Verify dedicated JSONB column in media_assets table
+      const dbRes = await testPool.query<{ transcoding_config: any }>(
+        `SELECT transcoding_config FROM media_assets WHERE id = $1;`,
+        [body.id]
+      );
+      assert.deepStrictEqual(dbRes.rows[0]?.transcoding_config, { profiles: ['720p', '1080p'] });
+
+      // Verify GET /v1/media/:id returns transcoding_config
+      const getRes = await app.inject({
+        method: 'GET',
+        url: `/v1/media/${body.id}`,
+        headers: { Authorization: `Bearer ${activeApiKey}` },
+      });
+      assert.strictEqual(getRes.statusCode, 200);
+      const getBody = JSON.parse(getRes.payload);
+      assert.deepStrictEqual(getBody.transcoding_config, { profiles: ['720p', '1080p'] });
+    });
+
+    it('should successfully register media with enabled: false transcoding', async () => {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/v1/media',
+        headers: { Authorization: `Bearer ${activeApiKey}` },
+        payload: {
+          original_filename: 'disabled_transcode.mp4',
+          mime_type: 'video/mp4',
+          file_size_bytes: 4096,
+          transcoding: {
+            enabled: false,
+          },
+        },
+      });
+
+      assert.strictEqual(res.statusCode, 201);
+      const body = JSON.parse(res.payload);
+      assert.deepStrictEqual(body.transcoding_config, { enabled: false });
+    });
+
+    it('should successfully register media with empty profiles list (profiles: [])', async () => {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/v1/media',
+        headers: { Authorization: `Bearer ${activeApiKey}` },
+        payload: {
+          original_filename: 'empty_profiles.mp4',
+          mime_type: 'video/mp4',
+          file_size_bytes: 4096,
+          transcoding: {
+            profiles: [],
+          },
+        },
+      });
+
+      assert.strictEqual(res.statusCode, 201);
+      const body = JSON.parse(res.payload);
+      assert.deepStrictEqual(body.transcoding_config, { profiles: [] });
+    });
+
+    it('should reject registration with unknown profile name with 400', async () => {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/v1/media',
+        headers: { Authorization: `Bearer ${activeApiKey}` },
+        payload: {
+          original_filename: 'unknown_profile.mp4',
+          mime_type: 'video/mp4',
+          file_size_bytes: 4096,
+          transcoding: {
+            profiles: ['4k'],
+          },
+        },
+      });
+
+      assert.strictEqual(res.statusCode, 400);
+      const body = JSON.parse(res.payload);
+      assert.strictEqual(body.error, 'bad_request');
+      assert.match(body.message, /Unknown profile "4k"/);
+    });
+
+    it('should reject registration with duplicate profile names with 400', async () => {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/v1/media',
+        headers: { Authorization: `Bearer ${activeApiKey}` },
+        payload: {
+          original_filename: 'duplicate_profile.mp4',
+          mime_type: 'video/mp4',
+          file_size_bytes: 4096,
+          transcoding: {
+            profiles: ['720p', '720p'],
+          },
+        },
+      });
+
+      assert.strictEqual(res.statusCode, 400);
+      const body = JSON.parse(res.payload);
+      assert.strictEqual(body.error, 'bad_request');
+      assert.match(body.message, /Duplicate profile "720p"/);
+    });
+
+    it('should reject registration with enabled: false combined with non-empty profiles with 400', async () => {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/v1/media',
+        headers: { Authorization: `Bearer ${activeApiKey}` },
+        payload: {
+          original_filename: 'invalid_disabled.mp4',
+          mime_type: 'video/mp4',
+          file_size_bytes: 4096,
+          transcoding: {
+            enabled: false,
+            profiles: ['720p'],
+          },
+        },
+      });
+
+      assert.strictEqual(res.statusCode, 400);
+      const body = JSON.parse(res.payload);
+      assert.strictEqual(body.error, 'bad_request');
+      assert.match(body.message, /cannot be specified when transcoding is disabled/);
     });
   });
 

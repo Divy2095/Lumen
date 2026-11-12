@@ -1,0 +1,70 @@
+services:
+  postgres-test:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: lumen_test
+      POSTGRES_USER: lumen_test_admin
+      POSTGRES_PASSWORD: ${LUMEN_TEST_ADMIN_PASSWORD:?required}
+      LUMEN_TEST_DB_PASSWORD: ${LUMEN_TEST_DB_PASSWORD:?required}
+      LUMEN_TEST_DISPOSABLE_TOKEN: ${LUMEN_TEST_DISPOSABLE_TOKEN:?required}
+    tmpfs:
+      - /var/lib/postgresql/data
+    volumes:
+      - ./infra/test/init-postgres.sh:/docker-entrypoint-initdb.d/10-disposable.sh:ro,Z
+    networks: [isolated-test]
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -h 127.0.0.1 -U lumen_test_admin -d lumen_test']
+      interval: 2s
+      timeout: 2s
+      retries: 30
+  redis-test:
+    image: redis:7-alpine
+    environment:
+      REDIS_PASSWORD: ${LUMEN_TEST_REDIS_PASSWORD:?required}
+      LUMEN_TEST_DISPOSABLE_TOKEN: ${LUMEN_TEST_DISPOSABLE_TOKEN:?required}
+    command:
+      - sh
+      - -ec
+      - |
+        redis-server --save '' --appendonly no --requirepass "$$REDIS_PASSWORD" &
+        child=$$!
+        trap 'kill "$$child"; wait "$$child"' TERM INT
+        export REDISCLI_AUTH="$$REDIS_PASSWORD"
+        until redis-cli ping >/dev/null 2>&1; do sleep 0.1; done
+        redis-cli SET lumen:test:disposable "$$LUMEN_TEST_DISPOSABLE_TOKEN" >/dev/null
+        wait "$$child"
+    tmpfs: [/data]
+    networks: [isolated-test]
+    healthcheck:
+      test: [CMD-SHELL, 'REDISCLI_AUTH="$$REDIS_PASSWORD" redis-cli GET lumen:test:disposable | grep -qx "$$LUMEN_TEST_DISPOSABLE_TOKEN"']
+      interval: 2s
+      timeout: 2s
+      retries: 30
+  test-runner:
+    build:
+      context: .
+      dockerfile: infra/test/Dockerfile
+    environment:
+      LUMEN_ALLOW_DESTRUCTIVE_TESTS: ${LUMEN_ALLOW_DESTRUCTIVE_TESTS:-0}
+      LUMEN_TEST_DISPOSABLE_TOKEN: ${LUMEN_TEST_DISPOSABLE_TOKEN:?required}
+      PGHOST: postgres-test
+      PGPORT: '5432'
+      PGDATABASE: lumen_test
+      PGUSER: lumen_test_runner
+      PGPASSWORD: ${LUMEN_TEST_DB_PASSWORD:?required}
+      REDIS_HOST: redis-test
+      REDIS_PORT: '6379'
+      REDIS_DB: '0'
+      REDIS_PASSWORD: ${LUMEN_TEST_REDIS_PASSWORD:?required}
+      STORAGE_BASE_DIR: /lumen-test-storage/runtime
+    tmpfs:
+      - /lumen-test-storage:mode=1777
+      - /tmp:mode=1777
+    networks: [isolated-test]
+    depends_on:
+      postgres-test: {condition: service_healthy}
+      redis-test: {condition: service_healthy}
+    command: [npm, run, 'test:integration:check']
+networks:
+  isolated-test:
+    internal: true
