@@ -9,6 +9,11 @@ Milestone 3.5.3 implements rotation-aware transcoding without upscaling, validat
 H.264/AAC output, renewed/fenced leases, safe redelivery, and contained local storage.
 This is development software, not a production-readiness claim.
 
+Milestone 3.6 adds local operator-controlled project provisioning and API-key
+issuance, metadata listing, revocation, and staged rotation. See the
+[developer onboarding guide](docs/developer-onboarding.md) for the first credential
+and the [key lifecycle guide](docs/api-key-lifecycle.md) for recovery and rotation.
+
 ## Requirements
 
 - Node.js 24+ and npm; dependencies are locked in package-lock.json.
@@ -39,7 +44,15 @@ Development Compose persists data and publishes PostgreSQL/Redis only on loopbac
    `002_add_transcoding_config.sql`. Do not execute SQL files wholesale: they also
    contain destructive Down sections. `db:migrate:down` is destructive and requires
    deliberate authorization; it is not a test-reset command.
-6. In separate terminals run `npm run dev`, `npm run outbox:publisher`, and
+6. From a private interactive terminal, create ownership metadata and a project:
+   `npm run provision -- project:create --database lumen --role lumen --name "Example project" --email developer@example.com`.
+   Record the returned account/project UUIDs. Email ownership is not verified.
+7. Issue a key using the actual returned project UUID:
+   `npm run provision -- key:issue --database lumen --role lumen --project-id '<project-uuid>' --name "Development"`.
+   Replace the quoted placeholder. Check the displayed database target and type the
+   requested confirmation. The key is shown once after confirmed persistence;
+   save it securely. Keys expire in 90 days unless an explicit override is supplied.
+8. In separate terminals run `npm run dev`, `npm run outbox:publisher`, and
    `npm run worker`. All three load .env and must use the same database and Redis.
 
 Use the **same absolute STORAGE_BASE_DIR** for API and workers. Run from the
@@ -55,9 +68,18 @@ Check `/health` for liveness and `/ready` for database readiness.
 
 Project API keys are accepted as `Authorization: Bearer <key>` or `X-API-Key`.
 Expired/revoked keys and inactive projects are rejected. Only key hashes are stored.
-**No supported public project/API-key provisioning endpoint or CLI exists yet.**
-Integration tests seed their own credentials in disposable databases; that is not
-an operational provisioning workflow.
+Provisioning is supported through `npm run provision -- --help`. Operator database
+access is separate from media API-key authentication: possessing a project key
+does not grant database access or permission to provision credentials. Provisioning
+needs PostgreSQL only; the processing API additionally needs the services above.
+There is no public signup, login, OAuth, session, or management HTTP API.
+
+The CLI supports `project:create`, `project:list`, `key:issue`, `key:list`,
+`key:revoke`, and `key:rotate`. Writes require interactive stdin/stdout and typed
+confirmation. There is no unattended write/secret-output mode. Explicit
+`--no-expiry` opts into a non-expiring key; `--expires-at` chooses a future UTC
+timestamp. Rotation leaves the predecessor valid until explicitly revoked.
+See [safe API examples and first-run commands](docs/developer-onboarding.md).
 
 | Endpoint | Authorization / behavior |
 | --- | --- |
@@ -98,7 +120,16 @@ cases and 2,239 assertion calls**, with zero failures/skips after two stale test
 assertions were corrected. Migrations 001/002 and the complete authenticated HTTP
 upload → outbox → BullMQ → worker → rendition flow were verified. Its project was
 removed and development resources preserved. Final HTTP/documentation corrections
-postdate that run; the full integration suite was not rerun during finalization.
+postdate that run; the full integration suite was not rerun during 3.5.3 finalization.
+
+Milestone 3.6 Batch 3 subsequently verified the updated tree in a fresh disposable
+project: **420 cases across 29 files and 2,858 assertion calls**, zero failures or
+skips. Its 15 focused provisioning cases (94 assertion calls) exercised real
+PostgreSQL transactions and both lock orderings, existing API authentication and
+tenant isolation, and CLI reads/redirected-write refusal. Successful interactive
+CLI secret delivery was not exercised against a live database. Batch 4A adds
+documentation/security review and database-free verification, not another full
+integration run. See [security and verification notes](docs/milestone-3.6-security-review.md).
 
 Rootless Podman compatibility includes an internal network without published test
 ports, tmpfs data, a private SELinux label on the test-only init-script mount, and
@@ -106,7 +137,16 @@ Podman-compatible runner tmpfs options. The guide describes context selection.
 
 ## Limitations and roadmap
 
-- Credential provisioning/onboarding remains incomplete.
+- Onboarding is operator-controlled; public self-service identity/onboarding and
+  management HTTP APIs are not implemented. Account emails are unverified metadata.
+- Rotation is staged and not idempotent: duplicate/concurrent rotations can create
+  separate replacements. No predecessor relationship is persisted. See
+  [key recovery and limitations](docs/api-key-lifecycle.md).
+- Live successful PTY secret reveal remains a coverage gap. Terminal recording,
+  screen capture, and shoulder surfing are outside the CLI's protection.
+- The locked migration-tool dependency chain has three moderate npm audit findings
+  representing two underlying advisories; see the scoped
+  [dependency review](docs/milestone-3.6-security-review.md). No automatic upgrade was applied.
 - Signed completion/failure webhooks remain in the MVP roadmap.
 - Range/206 support, HLS, resumable uploads, SDKs, S3, and usage analytics are planned.
 - Crash orphan reconciliation is a [proposal](docs/rendition-file-safety.md), not an

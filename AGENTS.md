@@ -74,17 +74,42 @@ Milestone 3.5.3 implements video transcoding on the existing ingestion pipeline:
 - Renewed/fenced transcode leases, safe redelivery, contained storage, non-overwriting
   publication, temporary cleanup, and conservative uncertain-COMMIT handling.
 
-Batch 4B historically passed 336 integration cases with 2,239 assertion calls in a
-separate disposable cluster. Final HTTP corrections are checked with database-free
-regressions; do not describe the historical suite as rerun after those changes.
+Milestone 3.5.3 Batch 4B historically passed 336 cases with 2,239 assertion calls;
+its final HTTP corrections were not rechecked in integration tests during finalization.
+Milestone 3.6 Batch 3 later verified the updated tree with 420 cases across 29 files
+and 2,858 assertion calls in a fresh disposable cluster, including 15 live
+provisioning cases with 94 assertion calls. Keep these separate historical runs
+distinct; documentation-only verification is not another integration run.
+
+Milestone 3.6 now implements a local operator TypeScript CLI (`npm run provision`):
+
+- project:create/project:list; key:issue/key:list/key:revoke/key:rotate.
+- Existing accounts/projects/api_keys schema; accounts are ownership metadata,
+  not authenticated users, and email ownership is not verified.
+- Explicit configured/connected database and session-role checks, typed write
+  confirmation, and interactive stdin/stdout requirements.
+- Existing random-key generator, hash-only persistence, 90-day default expiry,
+  explicit non-expiring opt-in, and one-time secret reveal after confirmed COMMIT.
+- Project-scoped metadata listing and idempotent revocation; project -> key lock
+  ordering and post-lock database-time validation for staged rotation.
+- No automatic predecessor revocation, write retries, plaintext recovery, public
+  signup/login/OAuth/sessions, or management HTTP endpoints.
+
+Preserve secret-free error/recovery paths. Unknown COMMIT outcomes must not return
+credentials or be retried blindly. Media API keys must never gain provisioning
+authority. Live successful interactive PTY reveal remains unverified; negative
+terminal checks, unit tests, and live service tests do not close that gap.
+See docs/developer-onboarding.md, docs/api-key-lifecycle.md, and
+docs/milestone-3.6-security-review.md. Milestone 3.6 awaits final commit review;
+do not stage, commit, or push without explicit authorization.
 
 Use npm test for explicitly classified database-free files. Guarded integration
 commands require separate authorization to create disposable infrastructure and
 execute destructive setup. Never reuse development databases, Redis, or storage.
 See docs/isolated-integration-tests.md and docs/batch-4b-verification.md.
 
-Credential provisioning has no supported public endpoint/CLI yet. Signed webhooks,
-HTTP Range/206 support, orphan reconciliation, and production load verification
-remain outstanding. Do not invent a next milestone number or implement these
-without discussing scope. Discuss entities, constraints, and lifecycle requirements
-before adding or changing schema/migrations.
+Signed webhooks, HTTP Range/206 support, orphan reconciliation, and production
+load verification remain outstanding. The migration-tool advisories are documented
+with limited current exposure; dependency upgrades/overrides need separate approval.
+Do not invent a next milestone number or implement these without discussing scope.
+Discuss entities, constraints, and lifecycle requirements before schema changes.

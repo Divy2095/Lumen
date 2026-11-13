@@ -8,6 +8,7 @@
     "worker": "node --env-file-if-exists=.env --import tsx src/workers/index.ts",
     "outbox:publisher": "node --env-file-if-exists=.env --import tsx src/workers/outbox-publisher.ts",
     "job:test": "node --env-file-if-exists=.env --import tsx src/scripts/submit-test-job.ts",
+    "provision": "node --env-file-if-exists=.env --import tsx src/scripts/provision.ts",
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx src/test/run-tests.ts unit",
     "db:migrate": "node --env-file-if-exists=.env node_modules/.bin/node-pg-migrate up",
