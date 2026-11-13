@@ -41,7 +41,11 @@ Development Compose persists data and publishes PostgreSQL/Redis only on loopbac
    `docker compose --env-file .env -f compose.yaml up -d`.
 5. Review `npm run db:migrate:status`, then explicitly apply pending migrations
    with `npm run db:migrate`. Order: `001_initial_schema.sql`, then
-   `002_add_transcoding_config.sql`. Do not execute SQL files wholesale: they also
+   `002_add_transcoding_config.sql`, `003_webhook_contract.sql`, then
+   `004_webhook_encryption_key_metadata.sql`. Migrations 003/004
+   prepare webhook contracts and encryption metadata; signed delivery is not implemented
+   yet and their Down paths deliberately refuse to discard new history. See the
+   [webhook schema design](docs/webhook-contract.md). Do not execute SQL files wholesale: they also
    contain destructive Down sections. `db:migrate:down` is destructive and requires
    deliberate authorization; it is not a test-reset command.
 6. From a private interactive terminal, create ownership metadata and a project:
@@ -164,3 +168,7 @@ Podman-compatible runner tmpfs options. The guide describes context selection.
 - `migrations`: ordered PostgreSQL schema changes.
 - `infra/test`, `compose.test.yaml`: isolated disposable integration infrastructure.
 - `docs`: acceptance criteria, safety design, setup, and verification evidence.
+
+Operator webhook endpoint management is available through `npm run provision -- webhook:help`.
+See [endpoint management and external encryption keys](docs/webhook-endpoint-management.md).
+This configures destinations and signing secrets; outbound delivery remains unimplemented.

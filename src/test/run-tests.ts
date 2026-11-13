@@ -2,11 +2,15 @@ import { readdir } from 'node:fs/promises';
 import { resolve } from 'node:path';
 
 const integration = new Set(['database/schema.test.ts', 'modules/media/media.test.ts',
+  'database/webhook-schema.integration.test.ts', 'database/webhook-encryption.integration.test.ts',
+  'modules/webhooks/webhook-management.integration.test.ts',
   'modules/auth/provisioning.integration.test.ts',
   'modules/media/ffmpeg.service.test.ts', 'modules/media/ffprobe.service.test.ts',
   'modules/media/transcoding.service.test.ts', 'modules/media/transcoding-scheduling.test.ts',
   'workers/outbox-publisher.test.ts', 'workers/pipeline.test.ts', 'workers/worker.test.ts']);
 const safe = new Set(['modules/media/rendition-http.test.ts', 'config/redis.test.ts', 'modules/health/health.test.ts',
+  'modules/webhooks/webhook-contract.test.ts', 'modules/webhooks/webhook-security.test.ts',
+  'modules/webhooks/webhook-management.service.test.ts', 'modules/webhooks/webhook-management.cli.test.ts', 'database/webhook-schema-contract.test.ts', 'test/migration-plan.test.ts',
   'modules/auth/provisioning.service.test.ts', 'modules/auth/provisioning.cli.test.ts',
   'modules/auth/provisioning.lifecycle.test.ts',
   'modules/media/encoder-detection.test.ts', 'modules/media/resource-config.test.ts',

@@ -10,6 +10,7 @@ export const provisioningUsage = `Usage: npm run provision -- <command> --databa
   key:list --project-id <uuid>
   key:revoke --project-id <uuid> --key-id <uuid>
   key:rotate --project-id <uuid> --key-id <uuid> --name <name> [--expires-at <UTC timestamp> | --no-expiry]
+Webhook endpoint commands: npm run provision -- webhook:help
 Writes require an interactive terminal and typed confirmation. No --yes or piped secret output.
 Key lifetime defaults to 90 days. Account email ownership is not verified.
 Rotation only issues a replacement. Deploy and verify it, then explicitly revoke the predecessor.`;
@@ -76,7 +77,7 @@ export interface ProvisioningIO {
   write(message: string): Promise<void>;
   error(message: string): void;
   question(prompt: string): Promise<string>;
-  reveal(secret: string): Promise<void>;
+  reveal(secret: string, label?: string): Promise<void>;
 }
 export interface ProvisioningSession {
   service: Pick<ProvisioningService, 'verifyTarget' | 'createProject' | 'listProjects' | 'getProject' | 'issueKey' |

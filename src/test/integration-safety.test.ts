@@ -95,7 +95,7 @@ it('refuses storage escapes, sibling prefixes, and symlinks before recursive rem
 
 it('statically checks migration order and separates up SQL from destructive down SQL', async () => {
   const plan = await readTestMigrationPlan();
-  assert.deepEqual(plan.map((p) => p.name), ['001_initial_schema.sql', '002_add_transcoding_config.sql']);
+  assert.deepEqual(plan.map((p) => p.name), ['001_initial_schema.sql', '002_add_transcoding_config.sql', '003_webhook_contract.sql', '004_webhook_encryption_key_metadata.sql']);
   assert.match(plan[0]!.up, /CREATE TABLE media_assets/);
   assert.match(plan[1]!.up, /ADD COLUMN transcoding_config JSONB NULL/);
   for (const entry of plan) assert.doesNotMatch(entry.up, /^\s*(DROP|TRUNCATE|DELETE)\b/im);

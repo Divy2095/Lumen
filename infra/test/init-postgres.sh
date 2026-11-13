@@ -14,6 +14,9 @@ REVOKE CONNECT ON DATABASE template1 FROM PUBLIC;
 REVOKE ALL ON DATABASE lumen_test FROM PUBLIC;
 GRANT CONNECT ON DATABASE lumen_test TO lumen_test_runner;
 GRANT USAGE, CREATE ON SCHEMA public TO lumen_test_runner;
+-- Dedicated upgrade fixture: ownership here avoids granting CREATE on the database.
+CREATE SCHEMA lumen_test_webhook_upgrade AUTHORIZATION lumen_test_runner;
+REVOKE ALL ON SCHEMA lumen_test_webhook_upgrade FROM PUBLIC;
 CREATE SCHEMA lumen_test_safety;
 REVOKE ALL ON SCHEMA lumen_test_safety FROM PUBLIC;
 CREATE TABLE lumen_test_safety.disposable_environment (

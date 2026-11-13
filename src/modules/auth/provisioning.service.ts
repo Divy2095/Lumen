@@ -88,7 +88,7 @@ export class ProvisioningService {
     }
   }
 
-  private async transaction<T>(recovery: Record<string, string>, action: () => Promise<T>): Promise<T> {
+  async transaction<T>(recovery: Record<string, string>, action: () => Promise<T>): Promise<T> {
     let committing = false;
     try {
       await this.db.query('BEGIN');
@@ -140,7 +140,7 @@ export class ProvisioningService {
     return result.rows[0];
   }
 
-  private async lockProject(projectId: string, requireActive: boolean): Promise<void> {
+  async lockProject(projectId: string, requireActive: boolean): Promise<void> {
     const result = await this.db.query<Project>('SELECT id, account_id, name, status FROM projects WHERE id = $1 FOR UPDATE', [projectId]);
     const project = result.rows[0];
     if (!project) throw new ProvisioningError('PROJECT_NOT_FOUND');
@@ -157,7 +157,7 @@ export class ProvisioningService {
     return row;
   }
 
-  private async databaseTime(): Promise<Date> {
+  async databaseTime(): Promise<Date> {
     const result = await this.db.query<{ checked_at: Date }>('SELECT clock_timestamp() AS checked_at');
     const time = result.rows[0]?.checked_at;
     if (!(time instanceof Date) || !Number.isFinite(time.getTime())) throw new ProvisioningError('DATABASE_OPERATION_FAILED');

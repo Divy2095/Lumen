@@ -75,16 +75,38 @@ Tests prove ordinary failure, no-op, and empty-file handling without real servic
 
 ## Migration readiness
 
-The reviewed order is 001_initial_schema.sql, then 002_add_transcoding_config.sql.
+The reviewed order is 001_initial_schema.sql, 002_add_transcoding_config.sql, then
+003_webhook_contract.sql, then 004_webhook_encryption_key_metadata.sql
+(Milestone 3.7 schema and encryption metadata preparation).
 001 creates the 14 public application tables, keys, checks, and indexes. Its
 PostgreSQL 17 gen_random_uuid() default requires no extension. 002 adds nullable
 JSONB transcoding_config to media_assets. Both have node-pg-migrate Up/Down markers;
-the destructive Down sections are excluded from the reviewed up plan.
+the destructive Down sections are excluded from the reviewed up plan. Migration
+003 preserves legacy webhook rows, adds version-1 constraints/immutable bytes,
+and intentionally refuses Down to preserve history. See the
+[contract and migration design](webhook-contract.md).
 
 The test-only migration command audits that exact file set, verifies environment,
 PostgreSQL, Redis, and storage, then calls node-pg-migrate in up direction using the
-same guarded client. It has no reset/down mode. Both migrations and the actual restricted-role grants were verified in Batch 4B.
-The final HTTP corrections postdate that run; integration was not rerun afterward.
+same guarded client. It has no reset/down mode. Migration 004 preserves historical
+NULL encryption-key IDs and admits new/changed version-1 endpoints only with complete
+metadata. These tests were not executed in Batch 2. Batch 2B subsequently
+verified both fresh 001–004 and actual 001–003 → 004 upgrade paths, plus 533 guarded
+cases / 3,436 assertion calls and a separate real webhook CLI PTY scenario. See
+[the Batch 2B record](webhook-batch-2b-verification.md) and
+[endpoint management](webhook-endpoint-management.md). Migrations 001/002 and restricted-role
+grants were verified historically in 3.5.3 Batch 4B. Milestone 3.6 Batch 3 later
+verified the updated tree with 420 cases and 2,858 assertion calls. Neither run
+included migration 003. Milestone 3.7 Batch 1B subsequently applied 001/002/003 in a
+fresh disposable cluster and passed 484 cases with 3,098 assertion calls, including
+the legacy upgrade and live schema concurrency checks. See
+[the Batch 1B verification record](webhook-schema-verification.md).
+Never substitute development services.
+
+The disposable bootstrap also creates an empty `lumen_test_webhook_upgrade`
+schema owned by the restricted test role. The legacy-upgrade test verifies its
+ownership and emptiness before creating the pre-003 schema and data inside a
+rolled-back transaction. This avoids granting database-level CREATE privileges.
 
 ## Repeatable authorized-run procedure
 
