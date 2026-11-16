@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { Client } from 'pg';
 import { generateApiKey } from '../../shared/crypto.js';
+import { clerkProvider, isClerkSubject } from './clerk-identity.js';
 
 export class ProvisioningError extends Error {
   constructor(public readonly code: string, public readonly recovery?: Record<string, string>) {
@@ -15,6 +16,10 @@ export type CreateProjectInput = { name: string } & ({ accountId: string; email?
 export interface IssueKeyInput { projectId: string; name: string; expiresAt?: string; noExpiry?: boolean }
 export interface SelectedKey { projectId: string; keyId: string }
 export type RotateKeyInput = IssueKeyInput & SelectedKey;
+export interface LinkIdentityInput { accountId: string; provider: typeof clerkProvider; subject: string }
+export interface LinkedIdentity {
+  id: string; accountId: string; provider: typeof clerkProvider; subject: string; alreadyLinked: boolean;
+}
 interface KeyRow {
   id: string; project_id: string; name: string; key_prefix: string;
   created_at: Date; expires_at: Date | null; revoked_at: Date | null;
@@ -55,6 +60,11 @@ export function validateProject(input: CreateProjectInput): CreateProjectInput {
     throw new ProvisioningError('INVALID_EMAIL');
   }
   return { name, email: email.toLowerCase() };
+}
+export function validateIdentityLink(input: LinkIdentityInput): LinkIdentityInput {
+  if (input.provider !== clerkProvider) throw new ProvisioningError('UNSUPPORTED_PROVIDER');
+  if (!isClerkSubject(input.subject)) throw new ProvisioningError('INVALID_SUBJECT');
+  return { accountId: validateId(input.accountId), provider: clerkProvider, subject: input.subject };
 }
 export function keyExpiration(input: IssueKeyInput, now: Date): Date | null {
   validateId(input.projectId);
@@ -129,6 +139,33 @@ export class ProvisioningService {
   async listProjects(): Promise<Project[]> {
     await this.verifyTarget();
     return (await this.db.query<Project>('SELECT id, account_id, name, status FROM projects ORDER BY created_at, id')).rows;
+  }
+
+  async linkIdentity(raw: LinkIdentityInput): Promise<LinkedIdentity> {
+    const input = validateIdentityLink(raw);
+    return this.transaction({ accountId: input.accountId, provider: input.provider, subject: input.subject }, async () => {
+      // Lock the account so it cannot disappear between existence check and FK insert.
+      const account = await this.db.query('SELECT id FROM accounts WHERE id = $1 FOR KEY SHARE', [input.accountId]);
+      if (!account.rows[0]) throw new ProvisioningError('ACCOUNT_NOT_FOUND');
+
+      // The unique (provider, provider_subject) constraint is the concurrency
+      // arbiter. The loser waits, then observes the winner's committed mapping.
+      const inserted = await this.db.query<{ id: string }>(
+        `INSERT INTO account_identities (account_id, provider, provider_subject)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (provider, provider_subject) DO NOTHING
+         RETURNING id`,
+        [input.accountId, input.provider, input.subject]);
+      if (inserted.rows[0]) return { id: inserted.rows[0].id, ...input, alreadyLinked: false };
+
+      const existing = await this.db.query<{ id: string; account_id: string }>(
+        'SELECT id, account_id FROM account_identities WHERE provider = $1 AND provider_subject = $2',
+        [input.provider, input.subject]);
+      const row = existing.rows[0];
+      if (!row) throw new ProvisioningError('DATABASE_OPERATION_FAILED');
+      if (row.account_id !== input.accountId) throw new ProvisioningError('IDENTITY_CONFLICT');
+      return { id: row.id, ...input, alreadyLinked: true };
+    });
   }
 
   async getProject(id: string, requireActive = true): Promise<Project> {

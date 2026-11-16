@@ -9,12 +9,15 @@ const accountId = '01900000-0000-7000-8000-000000000001';
 const projectId = '01900000-0000-7000-8000-000000000002';
 const keyId = '01900000-0000-7000-8000-000000000003';
 const replacementId = '01900000-0000-7000-8000-000000000004';
+const identityId = '01900000-0000-7000-8000-000000000005';
+const clerkSubject = 'user_test123';
 const targetArgs = ['--database', 'lumen', '--role', 'lumen'];
 const issueArgs = ['key:issue', ...targetArgs, '--project-id', projectId, '--name', 'Local'];
 const createArgs = ['project:create', ...targetArgs, '--email', 'dev@example.com', '--name', 'Example'];
 const listArgs = ['key:list', ...targetArgs, '--project-id', projectId];
 const revokeArgs = ['key:revoke', ...targetArgs, '--project-id', projectId, '--key-id', keyId];
 const rotateArgs = ['key:rotate', ...targetArgs, '--project-id', projectId, '--key-id', keyId, '--name', 'Replacement'];
+const linkArgs = ['identity:link', ...targetArgs, '--account-id', accountId, '--provider', 'clerk', '--subject', clerkSubject];
 const project = { id: projectId, account_id: accountId, name: 'Example', status: 'active' };
 
 function fixture() {
@@ -61,6 +64,14 @@ function fixture() {
         return { id: replacementId, predecessorId: keyId, projectId, name: input.name,
           keyPrefix: key.keyPrefix, expiresAt: null, secret: key.apiKey };
       },
+      linkIdentity: async input => {
+        assert.equal(input.accountId, accountId); assert.equal(input.provider, 'clerk');
+        assert.equal(input.subject, clerkSubject); events.push('link');
+        if (issueError) throw issueError;
+        events.push('committed');
+        return { id: identityId, accountId: input.accountId, provider: input.provider,
+          subject: input.subject, alreadyLinked: false };
+      },
     },
     close: async () => { events.push('close'); },
   };
@@ -82,6 +93,23 @@ it('requires an explicit target and rejects unknown, duplicate, ambiguous, or in
   assert.ok(parsed.command === 'key:issue' && parsed.input.noExpiry);
   const existing = parseProvisioningArgs(['project:create', ...targetArgs, '--account-id', accountId, '--name', 'Example']);
   assert.ok(existing.command === 'project:create' && existing.input.accountId === accountId);
+});
+
+it('parses identity:link only with an explicit account, supported provider, and Clerk-shaped subject', () => {
+  const parsed = parseProvisioningArgs(linkArgs);
+  assert.ok(parsed.command === 'identity:link');
+  assert.deepEqual(parsed.input, { accountId, provider: 'clerk', subject: clerkSubject });
+  for (const args of [
+    ['identity:link', ...targetArgs, '--account-id', accountId, '--provider', 'clerk'],
+    ['identity:link', ...targetArgs, '--account-id', accountId, '--subject', clerkSubject],
+    ['identity:link', ...targetArgs, '--provider', 'clerk', '--subject', clerkSubject],
+    ['identity:link', ...targetArgs, '--account-id', 'invalid', '--provider', 'clerk', '--subject', clerkSubject],
+    ['identity:link', ...targetArgs, '--account-id', accountId, '--provider', 'github', '--subject', clerkSubject],
+    ['identity:link', ...targetArgs, '--account-id', accountId, '--provider', 'clerk', '--subject', 'not-a-user'],
+    ['identity:link', ...targetArgs, '--account-id', accountId, '--provider', 'clerk', '--subject', 'user_bad-name'],
+    ['identity:link', ...targetArgs, '--account-id', accountId, '--provider', 'clerk', '--subject', clerkSubject, '--yes'],
+    ['identity:link', ...targetArgs, '--account-id', accountId, '--account-id', accountId, '--provider', 'clerk', '--subject', clerkSubject],
+  ]) assert.throws(() => parseProvisioningArgs(args));
 });
 
 it('identifies database and project, confirms exact target, then reveals once only after commit', async () => {
@@ -221,7 +249,7 @@ it('connection cleanup failure returns a nonzero exit without retrying committed
 });
 
 it('real CLI propagates exit codes and rejects piped issuance without opening a database', async () => {
-  for (const [args, expected] of [[['--help'], 0], [issueArgs, 1], [revokeArgs, 1], [rotateArgs, 1]] as const) {
+  for (const [args, expected] of [[['--help'], 0], [issueArgs, 1], [revokeArgs, 1], [rotateArgs, 1], [linkArgs, 1]] as const) {
     const env = { ...process.env };
     delete env.NODE_TEST_CONTEXT;
     delete env.PGPASSWORD;
@@ -331,4 +359,59 @@ it('failed revocation result delivery reports committed state and selected recov
   assert.ok(f.errors.some(line => line.includes('Revocation committed')));
   assert.ok(f.errors.some(line => line.includes(projectId) && line.includes(keyId)));
   assert.equal(f.events.filter(x => x === 'revoke').length, 1);
+});
+
+it('links an identity only after exact confirmation and never reveals a secret', async () => {
+  const f = fixture(); f.setAnswer(`identity:link lumen lumen ${accountId} clerk ${clerkSubject}`);
+  assert.equal(await runProvisioningCli(linkArgs, f.io, f.connect), 0);
+  assert.deepEqual(f.events, ['connect', 'verify', 'link', 'committed', 'close']);
+  assert.equal(f.secrets.length, 0);
+  assert.equal(f.questions(), 1);
+  assert.ok(f.output.some(line => line.includes(accountId) && line.includes(clerkSubject)));
+  assert.ok(f.output.some(line => line.includes('"alreadyLinked":false')));
+});
+
+it('reports an identical repeated link as already linked without another write', async () => {
+  const f = fixture(); f.setAnswer(`identity:link lumen lumen ${accountId} clerk ${clerkSubject}`);
+  f.session.service.linkIdentity = async input => ({ id: identityId, accountId: input.accountId,
+    provider: input.provider, subject: input.subject, alreadyLinked: true });
+  assert.equal(await runProvisioningCli(linkArgs, f.io, f.connect), 0);
+  assert.ok(f.output.some(line => line.includes('"alreadyLinked":true')));
+  assert.equal(f.events.filter(x => x === 'link').length, 0);
+});
+
+it('rejects conflicting, unknown-account, and database identity failures with sanitized errors', async () => {
+  for (const [code, message] of [
+    ['IDENTITY_CONFLICT', 'already linked to a different account'],
+    ['ACCOUNT_NOT_FOUND', 'does not exist'],
+    ['DATABASE_IDENTITY_MISMATCH', 'does not match the explicit target'],
+  ] as const) {
+    const f = fixture(); f.setAnswer(`identity:link lumen lumen ${accountId} clerk ${clerkSubject}`);
+    f.session.service.linkIdentity = async () => { throw new ProvisioningError(code); };
+    assert.equal(await runProvisioningCli(linkArgs, f.io, f.connect), 1);
+    assert.ok(f.errors.some(line => line.includes(message)));
+    assert.equal(f.secrets.length, 0);
+    assert.ok(![...f.output, ...f.errors].join('').includes(f.key.apiKey));
+  }
+});
+
+it('refuses noninteractive identity writes before connecting and cancels mismatched confirmation', async () => {
+  const f = fixture(); f.setInteractive(false);
+  assert.equal(await runProvisioningCli(linkArgs, f.io, f.connect), 1);
+  assert.equal(f.events.length, 0);
+
+  const g = fixture(); g.setAnswer(`identity:link lumen lumen ${accountId} clerk user_wrong`);
+  assert.equal(await runProvisioningCli(linkArgs, g.io, g.connect), 2);
+  assert.ok(!g.events.includes('link'));
+  assert.equal(g.events.at(-1), 'close');
+});
+
+it('reports a committed identity link if result delivery fails without repeating the write', async () => {
+  const f = fixture(); f.setAnswer(`identity:link lumen lumen ${accountId} clerk ${clerkSubject}`);
+  f.io.write = async () => { if (f.events.includes('committed')) throw new Error('delivery failed'); };
+  assert.equal(await runProvisioningCli(linkArgs, f.io, f.connect), 1);
+  assert.equal(f.events.filter(x => x === 'link').length, 1);
+  assert.ok(f.errors.some(line => line.includes('Identity link committed')));
+  assert.ok(f.errors.some(line => line.includes(accountId) && line.includes(clerkSubject)));
+  assert.ok(!f.errors.join('').includes(f.key.apiKey));
 });

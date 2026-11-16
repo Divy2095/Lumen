@@ -5,6 +5,9 @@ import { generateApiKey } from '../../shared/crypto.js';
 import { ProvisioningService, ProvisioningError, keyExpiration, validateProject, validateId, validateName } from './provisioning.service.js';
 
 const accountId = '01900000-0000-7000-8000-000000000001';
+const otherAccountId = '01900000-0000-7000-8000-000000000006';
+const identityId = '01900000-0000-7000-8000-000000000005';
+const clerkSubject = 'user_test123';
 const projectId = '01900000-0000-7000-8000-000000000002';
 const target = { database: 'lumen', role: 'lumen' };
 const now = new Date('2030-01-01T00:00:00Z');
@@ -12,17 +15,23 @@ const input = { projectId, name: 'Development' };
 const project = { id: projectId, account_id: accountId, name: 'Example', status: 'active' };
 
 function fixture(options: { fail?: string; commitRollback?: boolean; missingAccount?: boolean; missingProject?: boolean;
-  inactive?: boolean; wrongProject?: boolean; wrongTarget?: boolean; rollbackFails?: boolean; duplicate?: boolean; suppressInsert?: boolean } = {}) {
+  inactive?: boolean; wrongProject?: boolean; wrongTarget?: boolean; rollbackFails?: boolean; duplicate?: boolean; suppressInsert?: boolean;
+  failIdentityInsert?: boolean; existingIdentityAccount?: string } = {}) {
   const calls: Array<{ sql: string; values: unknown[] }> = [];
   let generated = 0;
   const key = generateApiKey();
   const db = { query: async (sql: string, values: unknown[] = []) => {
     calls.push({ sql, values });
     if (sql === options.fail || (options.rollbackFails && sql === 'ROLLBACK')) throw new Error('sensitive database error');
+    if (options.failIdentityInsert && sql.startsWith('INSERT INTO account_identities')) throw new Error('sensitive identity detail');
     if (options.duplicate && sql.startsWith('INSERT INTO accounts')) throw Object.assign(new Error('private account detail'), { code: '23505' });
     let rows: unknown[] = [];
     if (sql.includes('current_database')) rows = [{ ...target, session_role: options.wrongTarget ? 'other' : 'lumen' }];
     else if (sql.startsWith('SELECT id FROM accounts')) rows = options.missingAccount ? [] : [{ id: accountId }];
+    else if (sql.startsWith('INSERT INTO account_identities')) rows = options.existingIdentityAccount ? [] : [{ id: identityId }];
+    else if (sql.startsWith('SELECT id, account_id FROM account_identities')) {
+      rows = options.existingIdentityAccount ? [{ id: identityId, account_id: options.existingIdentityAccount }] : [];
+    }
     else if (sql.startsWith('INSERT INTO projects')) rows = [{ id: values[0], account_id: values[1], name: values[2], status: 'active' }];
     else if (sql.startsWith('SELECT id, account_id')) rows = options.missingProject ? [] : [{ ...project,
       ...(options.inactive ? { status: 'deletion_pending' } : {}), ...(options.wrongProject ? { id: accountId } : {}) }];
@@ -187,4 +196,70 @@ it('lists project ownership metadata and previews only the requested active proj
   assert.ok(f.calls.some(c => c.sql.endsWith('WHERE id = $1') && c.values[0] === projectId));
   await assert.rejects(fixture({ missingProject: true }).service.getProject(projectId), { message: 'PROJECT_NOT_FOUND' });
   await assert.rejects(fixture({ inactive: true }).service.getProject(projectId), { message: 'PROJECT_INACTIVE' });
+});
+
+it('links a verified Clerk identity to an existing account transactionally and by UUID only', async () => {
+  const f = fixture();
+  const result = await f.service.linkIdentity({ accountId, provider: 'clerk', subject: clerkSubject });
+  assert.deepEqual(result, { id: identityId, accountId, provider: 'clerk', subject: clerkSubject, alreadyLinked: false });
+  assert.equal(f.calls[0]!.sql, 'BEGIN');
+  assert.ok(f.calls.some(c => c.sql.includes('accounts WHERE id = $1 FOR KEY SHARE') && c.values[0] === accountId));
+  const insertion = f.calls.find(c => c.sql.startsWith('INSERT INTO account_identities'))!;
+  assert.deepEqual(insertion.values, [accountId, 'clerk', clerkSubject]);
+  assert.match(insertion.sql, /ON CONFLICT \(provider, provider_subject\) DO NOTHING/);
+  assert.equal(f.calls.at(-1)!.sql, 'COMMIT');
+  assert.ok(!f.calls.some(c => /email/i.test(c.sql)));
+});
+
+it('reports an identical repeated link as already linked without changing accounts', async () => {
+  const f = fixture({ existingIdentityAccount: accountId });
+  const result = await f.service.linkIdentity({ accountId, provider: 'clerk', subject: clerkSubject });
+  assert.deepEqual(result, { id: identityId, accountId, provider: 'clerk', subject: clerkSubject, alreadyLinked: true });
+  assert.equal(f.calls.filter(c => c.sql.startsWith('INSERT INTO account_identities')).length, 1);
+  assert.equal(f.calls.at(-1)!.sql, 'COMMIT');
+});
+
+it('rejects a Clerk identity already linked to another account and rolls back', async () => {
+  const f = fixture({ existingIdentityAccount: otherAccountId });
+  await assert.rejects(f.service.linkIdentity({ accountId, provider: 'clerk', subject: clerkSubject }),
+    { message: 'IDENTITY_CONFLICT' });
+  assert.equal(f.calls.at(-1)!.sql, 'ROLLBACK');
+  assert.ok(!f.calls.some(c => c.sql === 'COMMIT'));
+});
+
+it('rejects unknown accounts and never inserts an identity', async () => {
+  const f = fixture({ missingAccount: true });
+  await assert.rejects(f.service.linkIdentity({ accountId, provider: 'clerk', subject: clerkSubject }),
+    { message: 'ACCOUNT_NOT_FOUND' });
+  assert.ok(!f.calls.some(c => c.sql.startsWith('INSERT INTO account_identities')));
+  assert.equal(f.calls.at(-1)!.sql, 'ROLLBACK');
+});
+
+it('rejects invalid providers, subjects, and account IDs before any database operation', async () => {
+  const f = fixture();
+  await assert.rejects(f.service.linkIdentity({ accountId, provider: 'github' } as never), { message: 'UNSUPPORTED_PROVIDER' });
+  for (const subject of ['', 'not-a-user', 'user_bad-name', 'user_' + 'a'.repeat(251), 'user_a\nb']) {
+    await assert.rejects(f.service.linkIdentity({ accountId, provider: 'clerk', subject }), { message: 'INVALID_SUBJECT' });
+  }
+  await assert.rejects(f.service.linkIdentity({ accountId: 'invalid', provider: 'clerk', subject: clerkSubject }),
+    { message: 'INVALID_UUID' });
+  assert.equal(f.calls.length, 0);
+});
+
+it('rolls back identity insertion failures with sanitized errors', async () => {
+  const f = fixture({ failIdentityInsert: true });
+  await assert.rejects(f.service.linkIdentity({ accountId, provider: 'clerk', subject: clerkSubject }),
+    { message: 'DATABASE_OPERATION_FAILED' });
+  assert.equal(f.calls.at(-1)!.sql, 'ROLLBACK');
+  assert.ok(!f.calls.some(c => c.sql === 'COMMIT'));
+});
+
+it('reports non-secret recovery IDs when an identity COMMIT outcome is unknown', async () => {
+  const f = fixture({ fail: 'COMMIT' });
+  await assert.rejects(f.service.linkIdentity({ accountId, provider: 'clerk', subject: clerkSubject }), error => {
+    assert.ok(error instanceof ProvisioningError);
+    assert.equal(error.code, 'COMMIT_OUTCOME_UNKNOWN');
+    assert.deepEqual(error.recovery, { accountId, provider: 'clerk', subject: clerkSubject });
+    return true;
+  });
 });

@@ -35,6 +35,7 @@ async function fixture(action: (service: ProvisioningService, client: PoolClient
 async function project(service: ProvisioningService) {
   return service.createProject({ name: 'Integration project', email: `${randomUUID()}@test.invalid` });
 }
+function identitySubject() { return `user_${randomUUID().replace(/-/g, '')}`; }
 async function authorizedStatus(secret: string) {
   return (await app.inject({ method: 'GET', url: `/v1/media/${randomUUID()}`, headers: { authorization: `Bearer ${secret}` } })).statusCode;
 }
@@ -220,6 +221,76 @@ it('lost COMMIT response against real PostgreSQL returns no secret and exposes o
   });
 });
 
+it('live identity linking is idempotent, preserves mappings, and rejects conflicts', { timeout: 15000 }, async () => {
+  await fixture(async (service, client) => {
+    const firstAccount = await project(service), otherAccount = await project(service);
+    const subject = identitySubject();
+    const linked = await service.linkIdentity({ accountId: firstAccount.account_id, provider: 'clerk', subject });
+    assert.equal(linked.alreadyLinked, false);
+    assert.equal(linked.accountId, firstAccount.account_id);
+
+    const stored = await client.query(
+      'SELECT account_id, provider, provider_subject FROM account_identities WHERE provider=$1 AND provider_subject=$2',
+      ['clerk', subject]);
+    assert.equal(stored.rowCount, 1);
+    assert.equal(stored.rows[0].account_id, firstAccount.account_id);
+
+    const again = await service.linkIdentity({ accountId: firstAccount.account_id, provider: 'clerk', subject });
+    assert.equal(again.alreadyLinked, true);
+    assert.equal(again.id, linked.id);
+    assert.equal((await client.query(
+      'SELECT count(*) AS count FROM account_identities WHERE provider=$1 AND provider_subject=$2',
+      ['clerk', subject])).rows[0].count, '1');
+
+    await assert.rejects(service.linkIdentity({ accountId: otherAccount.account_id, provider: 'clerk', subject }),
+      { message: 'IDENTITY_CONFLICT' });
+    assert.equal((await client.query(
+      'SELECT account_id FROM account_identities WHERE provider=$1 AND provider_subject=$2',
+      ['clerk', subject])).rows[0].account_id, firstAccount.account_id);
+  });
+});
+
+it('live identity linking rejects unknown accounts, invalid subjects, and unsupported providers', { timeout: 15000 }, async () => {
+  await fixture(async (service, client) => {
+    const before = Number((await client.query('SELECT count(*) AS count FROM account_identities')).rows[0].count);
+    await assert.rejects(service.linkIdentity({ accountId: randomUUID(), provider: 'clerk', subject: identitySubject() }),
+      { message: 'ACCOUNT_NOT_FOUND' });
+    await assert.rejects(service.linkIdentity({ accountId: randomUUID(), provider: 'clerk', subject: 'not-a-clerk-user' }),
+      { message: 'INVALID_SUBJECT' });
+    await assert.rejects(service.linkIdentity({ accountId: randomUUID(), provider: 'github', subject: identitySubject() } as never),
+      { message: 'UNSUPPORTED_PROVIDER' });
+    assert.equal(Number((await client.query('SELECT count(*) AS count FROM account_identities')).rows[0].count), before);
+  });
+});
+
+it('live concurrent conflicting identity links allow exactly one account mapping', { timeout: 20000 }, async () => {
+  const clients: PoolClient[] = [];
+  try {
+    for (let i = 0; i < 2; i++) clients.push(await connection());
+    const first = clients[0]!, second = clients[1]!;
+    const setup = new ProvisioningService(first, target);
+    const one = await project(setup), two = await project(setup);
+    const subject = identitySubject();
+
+    const results = await Promise.allSettled([
+      new ProvisioningService(first, target).linkIdentity({ accountId: one.account_id, provider: 'clerk', subject }),
+      new ProvisioningService(second, target).linkIdentity({ accountId: two.account_id, provider: 'clerk', subject }),
+    ]);
+    assert.equal(results.filter(result => result.status === 'fulfilled').length, 1);
+    const rejected = results.find((result): result is PromiseRejectedResult => result.status === 'rejected');
+    assert.ok(rejected);
+    assert.ok(rejected.reason instanceof ProvisioningError);
+    assert.equal(rejected.reason.code, 'IDENTITY_CONFLICT');
+
+    const rows = await first.query(
+      'SELECT account_id FROM account_identities WHERE provider=$1 AND provider_subject=$2', ['clerk', subject]);
+    assert.equal(rows.rowCount, 1);
+    assert.ok([one.account_id, two.account_id].includes(rows.rows[0].account_id));
+  } finally {
+    await Promise.allSettled(clients.map(async client => { try { await client.query('ROLLBACK'); } finally { client.release(); } }));
+  }
+});
+
 function deferred() {
   let resolve!: () => void;
   const promise = new Promise<void>(r => { resolve = r; });
@@ -327,5 +398,14 @@ it('real CLI refuses redirected lifecycle writes without mutation or credential 
     }
     assert.equal((await service.listKeys(p.id)).length, 1);
     assert.equal((await client.query('SELECT revoked_at FROM api_keys WHERE id=$1', [key.id])).rows[0].revoked_at, null);
+
+    const subject = identitySubject();
+    const identity = await cli(['identity:link', '--database', TEST_DATABASE, '--role', TEST_ROLE,
+      '--account-id', p.account_id, '--provider', 'clerk', '--subject', subject]);
+    assert.equal(identity.code, 1);
+    assert.ok(identity.output.includes('interactive stdin and stdout'));
+    assert.equal((await client.query(
+      'SELECT count(*) AS count FROM account_identities WHERE provider = $1 AND provider_subject = $2',
+      ['clerk', subject])).rows[0].count, '0');
   });
 });

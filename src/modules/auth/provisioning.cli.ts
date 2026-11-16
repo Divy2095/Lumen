@@ -1,6 +1,7 @@
 import {
-  ProvisioningError, keyExpiration, validateId, validateProject,
-  type CreateProjectInput, type DatabaseTarget, type IssueKeyInput, type ProvisioningService, type SelectedKey, type RotateKeyInput,
+  ProvisioningError, keyExpiration, validateId, validateIdentityLink, validateProject,
+  type CreateProjectInput, type DatabaseTarget, type IssueKeyInput, type LinkIdentityInput,
+  type ProvisioningService, type SelectedKey, type RotateKeyInput,
 } from './provisioning.service.js';
 
 export const provisioningUsage = `Usage: npm run provision -- <command> --database <database> --role <role> [options]
@@ -10,9 +11,11 @@ export const provisioningUsage = `Usage: npm run provision -- <command> --databa
   key:list --project-id <uuid>
   key:revoke --project-id <uuid> --key-id <uuid>
   key:rotate --project-id <uuid> --key-id <uuid> --name <name> [--expires-at <UTC timestamp> | --no-expiry]
+  identity:link --account-id <uuid> --provider clerk --subject <clerk-user-id>
 Webhook endpoint commands: npm run provision -- webhook:help
 Writes require an interactive terminal and typed confirmation. No --yes or piped secret output.
 Key lifetime defaults to 90 days. Account email ownership is not verified.
+Identity linking requires an existing account and never matches by email.
 Rotation only issues a replacement. Deploy and verify it, then explicitly revoke the predecessor.`;
 
 type Command =
@@ -21,7 +24,8 @@ type Command =
   | { command: 'key:issue'; target: DatabaseTarget; input: IssueKeyInput }
   | { command: 'key:list'; target: DatabaseTarget; projectId: string }
   | { command: 'key:revoke'; target: DatabaseTarget; input: SelectedKey }
-  | { command: 'key:rotate'; target: DatabaseTarget; input: RotateKeyInput };
+  | { command: 'key:rotate'; target: DatabaseTarget; input: RotateKeyInput }
+  | { command: 'identity:link'; target: DatabaseTarget; input: LinkIdentityInput };
 
 export function parseProvisioningArgs(args: string[]): Command {
   const command = args[0];
@@ -30,6 +34,7 @@ export function parseProvisioningArgs(args: string[]): Command {
     command === 'key:rotate' ? ['project-id', 'key-id', 'name', 'expires-at', 'no-expiry'] :
     command === 'key:revoke' ? ['project-id', 'key-id'] :
     command === 'key:list' ? ['project-id'] :
+    command === 'identity:link' ? ['account-id', 'provider', 'subject'] :
       command === 'project:list' ? [] : null;
   if (!allowed) throw new ProvisioningError('INVALID_ARGUMENTS');
   const options = new Map<string, string>();
@@ -51,6 +56,13 @@ export function parseProvisioningArgs(args: string[]): Command {
     throw new ProvisioningError('EXPLICIT_DATABASE_TARGET_REQUIRED');
   }
   const target = { database, role };
+  if (command === 'identity:link') {
+    const provider = options.get('provider');
+    if (provider !== 'clerk') throw new ProvisioningError('UNSUPPORTED_PROVIDER');
+    return { command, target, input: validateIdentityLink({
+      accountId: options.get('account-id') ?? '', provider, subject: options.get('subject') ?? '',
+    }) };
+  }
   if (command === 'project:list') return { command, target };
   if (command === 'key:list') return { command, target, projectId: validateId(options.get('project-id') ?? '') };
   if (command === 'key:revoke') return { command, target, input: {
@@ -81,7 +93,7 @@ export interface ProvisioningIO {
 }
 export interface ProvisioningSession {
   service: Pick<ProvisioningService, 'verifyTarget' | 'createProject' | 'listProjects' | 'getProject' | 'issueKey' |
-    'listKeys' | 'getKey' | 'revokeKey' | 'rotateKey'>;
+    'listKeys' | 'getKey' | 'revokeKey' | 'rotateKey' | 'linkIdentity'>;
   endpoint: { host: string; port: number };
   close(): Promise<void>;
 }
@@ -96,6 +108,9 @@ const messages: Record<string, string> = {
   INVALID_EXPIRATION: 'Choose a future UTC timestamp or explicit --no-expiry; these options are mutually exclusive.',
   DATABASE_IDENTITY_MISMATCH: 'Configured or connected database identity does not match the explicit target.',
   ACCOUNT_NOT_FOUND: 'The selected account does not exist.',
+  INVALID_SUBJECT: 'The Clerk subject must be a Clerk user ID of the form user_<alphanumeric>.',
+  UNSUPPORTED_PROVIDER: 'The only supported identity provider in this milestone is clerk.',
+  IDENTITY_CONFLICT: 'That Clerk identity is already linked to a different account. No mapping was changed.',
   PROJECT_NOT_FOUND: 'The selected project does not exist.',
   PROJECT_INACTIVE: 'The selected project is inactive.',
   PROJECT_IDENTITY_MISMATCH: 'Project identity verification failed.',
@@ -109,6 +124,7 @@ const messages: Record<string, string> = {
   SECRET_DELIVERY_FAILED: 'Persistence succeeded but secret delivery failed or is uncertain. Do not retry blindly; retain the key ID for recovery.',
   RESULT_DELIVERY_FAILED: 'Project persistence succeeded but result delivery failed. Do not retry blindly; inspect recovery IDs first.',
   REVOCATION_DELIVERY_FAILED: 'Revocation committed but result delivery failed. Inspect the selected key with key:list.',
+  IDENTITY_DELIVERY_FAILED: 'Identity link committed but result delivery failed. Inspect account_identities before retrying.',
 };
 
 export async function runProvisioningCli(args: string[], io: ProvisioningIO,
@@ -118,6 +134,7 @@ export async function runProvisioningCli(args: string[], io: ProvisioningIO,
   let predecessorId: string | undefined;
   let revokedKey: SelectedKey | undefined;
   let persistedProject: { projectId: string; accountId: string } | undefined;
+  let linkedIdentity: { accountId: string; provider: string; subject: string } | undefined;
   try {
     if (args.length === 1 && args[0] === '--help') { await io.write(provisioningUsage); return 0; }
     const command = parseProvisioningArgs(args);
@@ -131,6 +148,18 @@ export async function runProvisioningCli(args: string[], io: ProvisioningIO,
     }
     if (command.command === 'key:list') {
       await io.write(JSON.stringify(await session.service.listKeys(command.projectId)));
+      return 0;
+    }
+    if (command.command === 'identity:link') {
+      const { accountId, provider, subject } = command.input;
+      await io.write(`Link Clerk identity to existing account: ${JSON.stringify(command.input)}`);
+      const phrase = `identity:link ${command.target.database} ${command.target.role} ${accountId} ${provider} ${subject}`;
+      const answer = await io.question(`Type ${JSON.stringify(phrase)} to confirm identity linking: `);
+      if (answer !== phrase) throw new ProvisioningError('CONFIRMATION_CANCELLED');
+      if (!io.interactive()) throw new ProvisioningError('INTERACTIVE_TERMINAL_REQUIRED');
+      const result = await session.service.linkIdentity(command.input);
+      linkedIdentity = { accountId, provider, subject };
+      await io.write(JSON.stringify(result));
       return 0;
     }
     if (command.command !== 'project:create') {
@@ -173,12 +202,14 @@ export async function runProvisioningCli(args: string[], io: ProvisioningIO,
     return 0;
   } catch (error) {
     const known = error instanceof ProvisioningError;
-    const code = persistedKeyId ? 'SECRET_DELIVERY_FAILED' : revokedKey ? 'REVOCATION_DELIVERY_FAILED' : persistedProject ? 'RESULT_DELIVERY_FAILED' : known ? error.code : 'DATABASE_OPERATION_FAILED';
+    const code = persistedKeyId ? 'SECRET_DELIVERY_FAILED' : revokedKey ? 'REVOCATION_DELIVERY_FAILED' :
+      linkedIdentity ? 'IDENTITY_DELIVERY_FAILED' : persistedProject ? 'RESULT_DELIVERY_FAILED' : known ? error.code : 'DATABASE_OPERATION_FAILED';
     io.error(messages[code] ?? 'Provisioning failed. Internal details have been suppressed.');
     if (known && error.recovery) io.error(`Recovery IDs: ${JSON.stringify(error.recovery)}`);
     if (persistedKeyId) io.error(`Persisted key ID: ${persistedKeyId}`);
     if (predecessorId) io.error(`Predecessor key ID: ${predecessorId}; rotation remains incomplete until explicit revocation.`);
     if (revokedKey) io.error(`Recovery IDs: ${JSON.stringify(revokedKey)}`);
+    if (linkedIdentity) io.error(`Recovery IDs: ${JSON.stringify(linkedIdentity)}`);
     if (persistedProject) io.error(`Recovery IDs: ${JSON.stringify(persistedProject)}`);
     return code === 'CONFIRMATION_CANCELLED' ? 2 : 1;
   } finally {
