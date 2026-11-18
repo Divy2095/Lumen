@@ -19,6 +19,7 @@
     "migrate:status": "npm run db:migrate:status",
     "test:integration": "node --import tsx src/test/run-tests.ts integration",
     "test:integration:check": "node --import tsx src/test/check-integration.ts",
+    "test:integration:wait": "node --import tsx src/test/wait-integration.ts",
     "test:integration:migrate": "node --import tsx src/test/migrate-test.ts"
   },
   "keywords": [],

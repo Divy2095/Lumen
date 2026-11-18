@@ -27,6 +27,12 @@ and the [key lifecycle guide](docs/api-key-lifecycle.md) for recovery and rotati
 
 ## Local development
 
+For a single-command launcher that manages PostgreSQL, Redis, the API, the outbox
+publisher, the worker, and Lumen Web, see
+[the local development stack guide](docs/local-development-stack.md). The manual
+setup below remains the source of truth for first-time configuration and
+provisioning.
+
 These are operator setup instructions; they are separate from disposable tests.
 Development Compose persists data and publishes PostgreSQL/Redis only on loopback.
 

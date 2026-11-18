@@ -2,17 +2,21 @@ import Fastify, { type FastifyInstance, type FastifyServerOptions, type FastifyE
 import cors from '@fastify/cors';
 import databasePlugin from './plugins/database.js';
 import authenticatePlugin from './plugins/authenticate.js';
-import clerkAuthPlugin from './modules/auth/clerk.service.js';
+import clerkAuthPlugin, { type ClerkService } from './modules/auth/clerk.service.js';
+import { browserProjectRoutes } from './modules/browser/browser-project.route.js';
+import { browserMediaRoutes } from './modules/browser/browser-media.route.js';
 import { getCorsConfig } from './config/cors.js';
 import { healthRoutes } from './modules/health/health.route.js';
 import { mediaRoutes } from './modules/media/media.route.js';
 
 export interface BuildAppOptions extends FastifyServerOptions {
   skipDatabase?: boolean;
+  /** In-process verification service injection for deterministic tests, never request-controlled. */
+  clerkService?: ClerkService | null;
 }
 
 export function buildApp(opts: BuildAppOptions = {}): FastifyInstance {
-  const { skipDatabase, ...fastifyOpts } = opts;
+  const { skipDatabase, clerkService, ...fastifyOpts } = opts;
   const app = Fastify(fastifyOpts);
 
   const corsConfig = getCorsConfig();
@@ -24,7 +28,7 @@ export function buildApp(opts: BuildAppOptions = {}): FastifyInstance {
     maxAge: 600,
   });
 
-  app.register(clerkAuthPlugin);
+  app.register(clerkAuthPlugin, clerkService === undefined ? {} : { service: clerkService });
 
   // Content type parser for raw binary streaming uploads.
   // Supports video/mp4 with media parameters (e.g. codecs, charset) and application/octet-stream.
@@ -71,6 +75,8 @@ export function buildApp(opts: BuildAppOptions = {}): FastifyInstance {
     app.register(databasePlugin);
     app.register(authenticatePlugin);
     app.register(mediaRoutes);
+    app.register(browserProjectRoutes);
+    app.register(browserMediaRoutes);
   }
 
   app.register(healthRoutes);

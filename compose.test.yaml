@@ -62,8 +62,9 @@ services:
       - /tmp:mode=1777
     networks: [isolated-test]
     depends_on:
-      postgres-test: {condition: service_healthy}
-      redis-test: {condition: service_healthy}
+      # Startup ordering only: client readiness + connected safety preflight are required.
+      postgres-test: {condition: service_started}
+      redis-test: {condition: service_started}
     command: [npm, run, 'test:integration:check']
 networks:
   isolated-test:

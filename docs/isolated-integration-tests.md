@@ -126,7 +126,8 @@ export LUMEN_ALLOW_DESTRUCTIVE_TESTS=1
 
 docker --context rootless compose --project-name "$LUMEN_TEST_PROJECT" --env-file .env.integration -f compose.test.yaml config --quiet
 docker --context rootless compose --project-name "$LUMEN_TEST_PROJECT" --env-file .env.integration -f compose.test.yaml build test-runner
-docker --context rootless compose --project-name "$LUMEN_TEST_PROJECT" --env-file .env.integration -f compose.test.yaml up -d --wait postgres-test redis-test
+docker --context rootless compose --project-name "$LUMEN_TEST_PROJECT" --env-file .env.integration -f compose.test.yaml up -d postgres-test redis-test
+docker --context rootless compose --project-name "$LUMEN_TEST_PROJECT" --env-file .env.integration -f compose.test.yaml run --rm --no-deps test-runner npm run test:integration:wait
 docker --context rootless compose --project-name "$LUMEN_TEST_PROJECT" --env-file .env.integration -f compose.test.yaml run --rm --no-deps test-runner npm run test:integration:check
 docker --context rootless compose --project-name "$LUMEN_TEST_PROJECT" --env-file .env.integration -f compose.test.yaml run --rm --no-deps test-runner npm run test:integration:migrate
 docker --context rootless compose --project-name "$LUMEN_TEST_PROJECT" --env-file .env.integration -f compose.test.yaml run --rm --no-deps test-runner npm run test:integration
@@ -140,6 +141,31 @@ legacy db:migrate command, add compose.yaml, attach development networks, publis
 ports, bind host storage, or reuse credentials. Cleanup must still run after test
 failure, using the retained test project name. No down -v or broad Docker cleanup
 is necessary; data is tmpfs, not named volumes.
+
+Client readiness is mandatory before the connected safety preflight. It runs as
+the initial process in a fresh `test-runner` container, not through `exec`.
+It authenticates as `lumen_test_runner` and executes `SELECT 1`, then authenticates
+to Redis DB 0 and requires `PING` → `PONG`. Each service has a 45-second retry
+deadline with bounded 1.5-second client operations; allow up to about 100 seconds
+overall including in-flight operations. Authentication/unexpected failures stop
+immediately. DNS, connection-refusal, startup, and timeout failures are reported
+as sanitized categories without credentials or raw driver errors.
+
+On rootless Podman 6.1.3/crun 1.31, container `exec` and health checks can fail
+before the command starts (`/proc/self/oom_score_adj: Permission denied`).
+Compose health checks remain available for diagnostics, but `--wait` is not the
+readiness gate here. `service_started` dependencies provide ordering only, never
+proof of readiness. The unchanged `test:integration:check` still verifies connected
+database identity/privileges, immutable markers, Redis identity, and storage
+before any guarded migration/test command. If readiness or safety preflight fails,
+stop and clean up; never proceed merely because containers are running.
+
+Always probe from `test-runner`. Do not launch a probe as `postgres-test` or
+`redis-test`: a one-off container using the same service can introduce ambiguous
+service aliases on some Compose/Podman combinations. For connectivity diagnosis,
+compare resolved addresses from the runner with inspected server addresses;
+distinguish DNS failures, refused/timed-out TCP connections, and authentication
+failures rather than inferring readiness from startup logs.
 
 Inspect preflight results and migration records on each fresh run. Batch 4B
 verified the complete API → outbox → BullMQ → worker → rendition path, including

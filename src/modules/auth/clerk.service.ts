@@ -148,7 +148,11 @@ export function registerClerkAuth(fastify: FastifyInstance, service: ClerkServic
   });
 }
 
-const clerkAuth: FastifyPluginAsync = async (fastify) => {
+const clerkAuth: FastifyPluginAsync<{ service?: ClerkService | null }> = async (fastify, options) => {
+  if (options.service !== undefined) {
+    registerClerkAuth(fastify, options.service);
+    return;
+  }
   const config = getClerkConfig();
   registerClerkAuth(fastify, config ? new ClerkService(config) : null);
 };

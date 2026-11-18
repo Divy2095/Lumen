@@ -6,6 +6,7 @@ import { Mp4StreamInspector } from './mp4-validator.js';
 import { defaultStorageService } from '../../shared/storage/local-storage.service.js';
 import { getStorageConfig } from '../../config/storage.js';
 import { InvalidTranscodingConfigError } from './transcoding-profiles.js';
+import { registrationBodySchema } from './media.schema.js';
 
 export const mediaRoutes: FastifyPluginAsync = async (fastify) => {
   const mediaService = new MediaService(fastify.db);
@@ -46,20 +47,7 @@ export const mediaRoutes: FastifyPluginAsync = async (fastify) => {
     {
       preHandler: [(fastify as any).authenticateApiKey],
       schema: {
-        body: {
-          type: 'object',
-          required: ['original_filename', 'mime_type', 'file_size_bytes'],
-          additionalProperties: false,
-          properties: {
-            original_filename: { type: 'string', minLength: 1, maxLength: 255 },
-            mime_type: { type: 'string', enum: ['video/mp4'] },
-            file_size_bytes: { type: 'integer', minimum: 1, maximum: getStorageConfig().maxUploadSizeBytes },
-            transcoding: {
-              type: 'object',
-              additionalProperties: true,
-            },
-          },
-        },
+        body: registrationBodySchema(),
       },
     },
     async (request, reply) => {

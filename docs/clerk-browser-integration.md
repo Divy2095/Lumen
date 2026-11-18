@@ -1,9 +1,8 @@
 # Clerk browser integration foundation
 
-Phase 8B adds the backend trust foundation for a future browser client. It does
-**not** make browser uploads available. No session, media registration, upload,
-thumbnail, or metadata routes are exposed to Clerk-authenticated browser clients
-yet. The existing project API-key and upload-token flows are unchanged.
+Phase 8B adds the backend trust foundation; Phase 8C-A exposes project context.
+Phase 8C-B adds Clerk-authenticated media registration, status, and thumbnails.
+The existing project API-key routes and single-use upload-token flow are unchanged.
 
 ## Why Clerk identity is separate from project API keys
 
@@ -16,9 +15,8 @@ boundaries explicit:
 - A Clerk token cannot authenticate an existing project API-key route.
 - A project API key is not accepted as a Clerk identity token.
 - Upload tokens and their single-use semantics are unchanged.
-- Project API keys must never be shipped to a browser. Phase 8C must keep using
-  server-side API keys for project operations, or add a separately reviewed
-  browser API.
+- Project API keys must never be shipped to a browser. Use the dedicated
+  `/v1/browser` endpoints with Clerk JWTs instead.
 
 ## CORS configuration
 
@@ -85,8 +83,114 @@ CLERK_AUTHORIZED_PARTIES=http://127.0.0.1:5173,http://127.0.0.1:4173
 - Partial Clerk configuration fails startup. A missing Clerk configuration
   makes the hook return `503 authentication_unavailable`, never a bypass.
 
-The verification service and hook are reusable but not attached to any route in
-Phase 8B. This is intentional: no demonstration endpoint is exposed.
+The same verification hook protects all `/v1/browser` endpoints. The in-process
+test service injection is not request-controlled and does not change production
+issuer, JWKS, `azp`, algorithm, expiration, or runtime identity checks.
+
+## Browser project context (Phase 8C-A)
+
+Send `Authorization: Bearer <Clerk JWT>` to `GET /v1/browser/project`.
+The API resolves the operator-linked account, then selects active projects using
+only that resolved account ID. Query/body account or project IDs cannot select
+a different project. No account or project is created automatically.
+
+- Exactly one active project: `200 { "id": "...", "name": "..." }`.
+- No identity mapping: `403 account_not_linked`.
+- No active projects (including inactive-only accounts): `403 no_active_project`.
+- Multiple active projects: `409 project_selection_ambiguous`; no arbitrary selection.
+- Authentication errors remain `401` or `503` as described below.
+
+Responses use `Cache-Control: no-store`. Account IDs, Clerk subjects, and API keys
+are not returned. Accounts have no suspension/status column; this endpoint checks
+project activity, not an invented account status. No database migration is included.
+
+## Browser media contracts (Phase 8C-B)
+
+All three endpoints require `Authorization: Bearer <Clerk JWT>` and resolve the
+single active project again on each request. They share the project endpoint's
+401/403/409/503 errors. Responses are `Cache-Control: no-store`; unexpected
+database/storage failures produce sanitized 500 responses.
+
+| Endpoint | Contract |
+| --- | --- |
+| `POST /v1/browser/media` | JSON: required `original_filename` (1–255 chars), `mime_type: "video/mp4"`, `file_size_bytes` (1–104857600); optional existing `transcoding` config. Returns 201 with `id`, `status`, filename/MIME/byte counts, `created_at`, `upload_token`, `upload_url`, `upload_expires_at`. No project/account IDs or API keys. |
+| `GET /v1/browser/media/:id` | UUID required; 200 with `id`, upload-lifecycle `status`, filename/MIME/byte counts, timestamps, `technical`, `thumbnail`, and `processing`. Nonexistent/cross-project asset: 404. |
+| `GET /v1/browser/media/:id/thumbnail` | UUID required; current project-owned JPEG bytes with `Content-Type: image/jpeg` and `Content-Length`. Missing/unfinished/cross-project thumbnail: 404. No public or permanent URL. |
+
+Registration rejects account/project selection fields in the body or query
+(`account_id`, `project_id`, and camel-case equivalents) before validation can
+strip them. Status/thumbnail query IDs never affect authorization. Invalid MIME,
+size, or transcoding configuration returns 400; no registration is inserted.
+Filenames are stripped of directory components as in the existing API.
+
+Status DTO example (technical fields are nullable before extraction):
+
+```json
+{
+  "id": "01900000-0000-7000-8000-000000000001",
+  "status": "ready",
+  "original_filename": "sample.mp4",
+  "mime_type": "video/mp4",
+  "file_size_bytes": 12345,
+  "uploaded_bytes": 12345,
+  "created_at": "2026-01-01T00:00:00.000Z",
+  "updated_at": "2026-01-01T00:00:01.000Z",
+  "technical": {
+    "duration_seconds": 2.5, "width": 640, "height": 360,
+    "video_codec": "h264", "audio_codec": null,
+    "bitrate": 500000, "frame_rate": 30
+  },
+  "thumbnail": { "status": "processing" },
+  "processing": [
+    { "operation": "extract_metadata", "status": "completed" },
+    { "operation": "generate_thumbnail", "status": "processing" }
+  ]
+}
+```
+
+`status: "ready"` means upload ingestion completed, **not** that processing
+finished. `processing` lists operation/state only: operations are
+`extract_metadata`, `generate_thumbnail`, `transcode`; states are `queued`,
+`processing`, `completed`, `failed`, `cancelled`. No percentages, internal job
+payloads, job IDs, raw ffprobe JSON, storage paths/keys, or account IDs are exposed.
+Multiple transcode jobs may have the same operation; playback/profile details
+are outside this batch. Before jobs exist, `processing` is empty.
+
+`thumbnail.status` is `ready` when a current output exists, otherwise the latest
+thumbnail job state (except completed-without-output yields `not_found`).
+When ready, its `url` is `/v1/browser/media/:id/thumbnail` and still requires
+Clerk authorization. Status describes recorded output; delivery can return 404
+if that file is missing. File containment and symlink checks remain enforced.
+
+### Browser sequence
+
+1. Sign in with Clerk; obtain a fresh session JWT.
+2. Optionally fetch `/v1/browser/project`; never select authority by client IDs.
+3. Register via `POST /v1/browser/media` using the Clerk JWT.
+4. PUT the raw `File`/`Blob` (not JSON/FormData/base64) to the returned relative
+   `upload_url`, using **the upload token**, not the Clerk JWT:
+   `Authorization: Bearer <upload_token>` and `Content-Type: video/mp4`.
+   Browsers provide `Content-Length` for a File/Blob; do not attempt to set this
+   forbidden header manually. The byte length must equal `file_size_bytes`.
+5. Poll `/v1/browser/media/:id` with a current Clerk JWT until the relevant jobs
+   reach a terminal state; `ready` alone is not sufficient.
+6. Fetch `thumbnail.url` with the Clerk Authorization header, call
+   `response.blob()`, and render `URL.createObjectURL(blob)`. Revoke that blob URL
+   when replaced/unmounted. A plain `<img src>` cannot attach the Bearer header.
+
+Upload credentials remain single-use, asset-bound, and expire after one hour.
+Existing Content-Length/container/timeout checks and failure handling are
+unchanged; consumed-token replay returns 409. The upload endpoint remains a
+bearer-capability endpoint, not a Clerk endpoint: possession grants upload even
+if project context subsequently changes. Keep both token types out of logs,
+URLs, and persistent browser storage. Registration is not idempotent; do not
+blindly retry an uncertain registration or consumed upload.
+
+For local development configure the exact Web origin in both
+`CORS_ALLOWED_ORIGINS` and `CLERK_AUTHORIZED_PARTIES`, including its port.
+Use `credentials: "omit"`; preflight requires no authentication. `localhost`
+and `127.0.0.1` are distinct. Use the returned relative URLs against the API
+origin, not the frontend origin.
 
 ## Failure responses
 
@@ -165,15 +269,16 @@ its unique index, and identity lookup queries should use the same collation.
 Alternatively, store a case-sensitive hash of the subject. Do not change this
 schema without separate approval.
 
-## Phase 8C handoff
+## Phase 8D handoff and limits
 
-Phase 8C can build on:
+Frontend integration is not implemented. Phase 8C-B has deterministic,
+database-free coverage and a guarded integration test prepared for a separately
+authorized disposable run; do not treat prepared tests as a live verification.
+The API, outbox publisher, and worker must use the same database/Redis and
+service-controlled storage root. No new services are required.
 
-- The strict CORS allowlist.
-- `authenticateClerk` for explicit browser-facing routes.
-- `ClerkIdentityResolver` with a verified identity.
-- The operator-only `identity:link` mapping.
-
-Phase 8C still needs its own review of route authorization, account/project
-selection, project API-key handling, upload-token issuance, and media
-serialization. Phase 8B alone does not expose browser media routes.
+Operators must link the exact Clerk subject to an existing account with exactly
+one active project. Multiple active projects fail closed; accounts have no
+independent suspension flag. Database collation must be checked as described
+above. There is no browser playback/rendition route, retry API, rate-limit/quota
+system, or new progress telemetry in this batch.

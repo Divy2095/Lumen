@@ -5,6 +5,7 @@ dist/
 !.env.example
 coverage/
 *.log
+.lumen-dev/
 .DS_Store
 skills
 AGENTS.md
